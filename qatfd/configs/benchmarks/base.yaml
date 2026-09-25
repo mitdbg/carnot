@@ -1,6 +1,9 @@
 # base config for all benchmarks
 # ALL paths below (splits_path, pdf_dir, + per-benchmark question/corpus paths)
-# are relative to qatfd/benchmarks/ — i.e. qatfd/benchmarks/<benchmark>/... .
+# are relative to qatfd/benchmarks/ — i.e. qatfd/benchmarks/<benchmark>/...
+# name of the benchmark
+name: null
+# name of the ChromaDB collection which stores this benchmark's files
 collection_name: null
 # ChromaDB server endpoint that reads connect to. Collections are always read via a long-lived warm
 # server (skunk/scripts/run_chroma_server.sh) — there is no embedded PersistentClient read path. Point
@@ -11,10 +14,10 @@ chroma_server_port: 8001
 pdf_dir: null
 # dev/test split JSON (under qatfd/benchmarks/): {"dev": [qids], "test": [qids]}. null => dev=all, test=empty.
 splits_path: null
-# (for CodexSystem) where the config.toml, sessions, and state live (relative to qatfd/benchmarks/)
-codex_home: null
-# (for CodexSystem) where the scratch directory for its work lives (relative to qatfd/benchmarks/)
-codex_scratch_dir: null
+# (for CodexSystem) where the base config.toml is stored
+codex_config_toml: null
+# (for CodexSystem) where the base AGENTS.md is stored
+codex_agents_md: null
 # (for CodexSystem) where the example answer schema file lives (relative to qatfd/benchmarks/)
 codex_answer_schema_file: null
 # (for CodexSystem) the URL for the MCP server which is serving the benchmark via tools

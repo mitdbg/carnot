@@ -13,8 +13,9 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from chromadb import Collection
+from chromadb.api import ClientAPI
 
-from skunk.common import ExecutionContext
+from skunk.common import ExecutionContext, PageLocator
 from skunk.storage.document_map import DocumentMap
 
 from qatfd.config import BenchmarkConfig
@@ -39,10 +40,12 @@ class BenchmarkResources:
 
     name: str  # the name of the benchmark
     chroma_collection: Collection  # chromadb Collection (vector index over chunks)
+    chroma_client: ClientAPI
     document_map: DocumentMap  # doc_id -> full text (for read_document / answer step)
     answer_format_hint: str = ""  # guidance on the format of the final answer (for the compute agent)
     compute_objective: str = ""  # one sentence on what the final answer is graded on (for the search agent)
     corpus_details: str | None = None  # information about the nature of the corpus, including available metadata fields
+    page_locator: PageLocator | None = None  # function which takes a doc_id and returns an object (PageSource) that points to the page to render this doc_id
 
 
 class Benchmark(ABC):
@@ -86,11 +89,11 @@ class Benchmark(ABC):
         cfg = self.config
         return f"server {cfg.storage.chroma_server_host}:{cfg.storage.chroma_server_port}"
 
-    def _open_chroma_collection(self) -> Collection:
+    def _open_chroma_collection(self) -> tuple[Collection, ClientAPI]:
         """Open the single configured Chroma collection (`collection_name`)."""
         client = self._chroma_client()
         try:
-            return client.get_collection(name=self.config.storage.collection_name)
+            return client.get_collection(name=self.config.storage.collection_name), client
         except Exception as e:
             raise RuntimeError(
                 f"chroma collection {self.config.storage.collection_name!r} not found ({self._chroma_where()})."

@@ -28,6 +28,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."   # repo root
 
+# Raise the open-file limit for the server. Chroma keeps every collection's HNSW segment open (4 files
+# each) and does not release them when working-set collections are deleted, so the default soft limit
+# of 1024 is exhausted after a few hundred search-agent working sets; past that point the server logs
+# `accept error: Too many open files` and every new client connection hangs forever.
+CHROMA_NOFILE="${SKUNK_CHROMA_NOFILE:-65536}"
+if ! ulimit -n "$CHROMA_NOFILE" 2>/dev/null; then
+  echo "WARNING: could not raise open-file limit to $CHROMA_NOFILE (hard limit: $(ulimit -Hn)); running with $(ulimit -n)" >&2
+fi
+
 # --- Load skunk/.env without clobbering vars already in the environment ---
 # Same idiom as run_solution.sh / run_practice_server.sh, so all three components share one
 # config source (SKUNK_CHROMADB_DIR, SKUNK_CHROMA_SERVER_*). An explicit shell export still wins.

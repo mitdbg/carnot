@@ -76,6 +76,10 @@ ERRORS = {
 }
 
 DEFAULT_MAX_LEN_OUTPUT = 50000
+# Budget of AST evaluations per step. Every call of a sandbox-defined function or lambda gets a budget of its
+# own (see `fresh_operations_budget`): the counter is meant to catch a runaway loop, not to cap how many
+# times a tool may invoke an agent-written callback (a `map_fn` over a 545k-chunk collection runs ~40 ops per
+# chunk, which used to exhaust the step's budget after ~255k chunks and fail every remaining call).
 MAX_OPERATIONS = 10000000
 MAX_WHILE_ITERATIONS = 1000000
 ALLOWED_DUNDER_METHODS = ["__init__", "__str__", "__repr__"]
@@ -361,6 +365,13 @@ def evaluate_unaryop(
         raise InterpreterError(f"Unary operation {expression.op.__class__.__name__} is not supported.")
 
 
+def fresh_operations_budget(state: dict[str, Any]) -> dict[str, Any]:
+    """Give `state` (a copy made for one function / lambda invocation) its own operation counter. `state.copy()`
+    is shallow, so without this every invocation would keep sharing -- and draining -- the caller's counter."""
+    state["_operations_count"] = {"counter": 0}
+    return state
+
+
 def evaluate_lambda(
     lambda_expression: ast.Lambda,
     state: dict[str, Any],
@@ -371,7 +382,7 @@ def evaluate_lambda(
     args = [arg.arg for arg in lambda_expression.args.args]
 
     def lambda_func(*values: Any) -> Any:
-        new_state = state.copy()
+        new_state = fresh_operations_budget(state.copy())
         for arg, value in zip(args, values):
             new_state[arg] = value
         return evaluate_ast(
@@ -417,7 +428,7 @@ def create_function(
     source_code = ast.unparse(func_def)
 
     def new_func(*args: Any, **kwargs: Any) -> Any:
-        func_state = state.copy()
+        func_state = fresh_operations_budget(state.copy())
         arg_names = [arg.arg for arg in func_def.args.args]
         default_values = [
             evaluate_ast(d, state, static_tools, custom_tools, authorized_imports) for d in func_def.args.defaults

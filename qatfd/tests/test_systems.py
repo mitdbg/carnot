@@ -54,7 +54,7 @@ class _StubSystem(SearchAgentSystem):
         self.config = SimpleNamespace()
         self._agent = agent
 
-    def _build_retrieve_agent(self, ctx, resources, q):
+    def _build_search_agent(self, ctx, resources, q):
         return self._agent
 
 

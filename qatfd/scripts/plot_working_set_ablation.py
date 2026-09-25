@@ -104,15 +104,17 @@ def load_runs(results_dir: Path) -> dict[tuple[str, str, str], dict]:
         scores = [float(r["score"]) for r in rows if r["score"] not in ("", "None")]
 
         def _mean(col: str) -> float:
-            vals = [float(r[col]) for r in rows if r[col] not in ("", "None")]
+            vals = [float(r[col]) for r in rows if r.get(col) not in (None, "", "None")]
             return sum(vals) / len(vals) if vals else 0.0
 
         metrics = {
             "n": len(rows),
             "score": sum(scores) / len(scores),
-            # isolate the search agent: retrieval-phase cost/latency, not whole-pipeline
-            "retrieve_cost_per_q": _mean("retrieve_cost"),
-            "retrieve_wall_s": _mean("retrieve_wall_s"),
+            # isolate the search agent: retrieval-phase cost/latency, not whole-pipeline. The
+            # Bootstrap / Enrich collection agents (precompute_* / enrich_*; absent on older runs)
+            # are part of retrieval, so their per-run spend is amortized over the questions here.
+            "retrieve_cost_per_q": _mean("retrieve_cost") + _mean("precompute_cost") + _mean("enrich_cost"),
+            "retrieve_wall_s": _mean("retrieve_wall_s") + _mean("precompute_wall_s") + _mean("enrich_wall_s"),
         }
         key = (arm, model, ws)
         if key not in runs or stamp > runs[key][0]:

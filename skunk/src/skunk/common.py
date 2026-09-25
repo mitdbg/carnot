@@ -13,9 +13,9 @@ import re
 import threading
 import time
 from chromadb import Collection
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, get_args
+from typing import TYPE_CHECKING, Literal, Protocol, get_args
 
 import tiktoken
 
@@ -31,66 +31,6 @@ if TYPE_CHECKING:
 # no thinking; "minimal" is the cheapest thinking tier.
 Effort = Literal["off", "minimal", "low", "medium", "high"]
 EFFORT_VALUES = get_args(Effort)
-
-@dataclass
-class B64Image:
-    """A single rendered page image ready to pass to an LLM: MIME type + base64 data."""
-
-    mime: str
-    data: str
-
-
-def pdf_path_for(doc: str, pdf_dir: Path | str) -> Path:
-    """The corpus PDF for a doc id: `<pdf_dir>/<doc>.pdf`. `doc` is the filename stem
-    (e.g. "combined_statement__modern__2024__c40") — the same key the page index uses."""
-    return Path(pdf_dir) / f"{doc}.pdf"
-
-
-def render_page_b64(
-    stem: str | None,
-    page: int | None,
-    *,
-    pdf_dir: Path | str,
-    renders_dir: Path | str | None = None,
-    dpi: int = 300,
-    fmt: str = "png",
-    jpg_quality: int | None = None,
-) -> B64Image | None:
-    """The single PDF-page rasterizer for the repo: render one page to in-memory image bytes via
-    PyMuPDF. `stem` is the doc-id stem naming the PDF (`<pdf_dir>/<stem>.pdf`). Returns None when
-    the PDF doesn't exist; PyMuPDF errors propagate. `fitz` is imported lazily so importing
-    `common` doesn't pull in PyMuPDF.
-
-    When `renders_dir` is given, a pre-rendered PNG at `<renders_dir>/<stem>_<page>.png` (the page
-    render cache) is served directly — skipping the PDF open. `dpi`/`fmt`/`jpg_quality` are
-    ignored for a cache hit (the cached PNG's own resolution applies); on a miss we fall back to
-    rasterizing the PDF."""
-    if stem is None or page is None or int(page) <= 0:
-        return None
-    if renders_dir is not None:
-        cached = Path(renders_dir) / f"{stem}_{int(page)}.png"
-        if cached.exists():
-            return B64Image(
-                mime="image/png",
-                data=base64.standard_b64encode(cached.read_bytes()).decode(),
-            )
-    pdf_path = pdf_path_for(stem, pdf_dir)
-    if not pdf_path.exists():
-        return None
-    import fitz
-
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    with fitz.open(pdf_path) as doc:
-        pix = doc[int(page) - 1].get_pixmap(matrix=mat)
-    if fmt == "jpg":
-        data = pix.tobytes(
-            "jpg", jpg_quality=jpg_quality if jpg_quality is not None else 95
-        )
-        mime = "image/jpeg"
-    else:
-        data = pix.tobytes("png")
-        mime = "image/png"
-    return B64Image(mime=mime, data=base64.standard_b64encode(data).decode())
 
 
 class _RateLimiter:
@@ -320,9 +260,6 @@ def strip_code_fence(s: str) -> str:
     return s.strip()
 
 
-# --- Cross-cutting runtime types threaded between operators and the orchestrator ---
-
-
 @dataclass(frozen=True)
 class PageRef:
     """Canonical page coordinate. Frozen so it's hashable — usable as a dict key
@@ -357,15 +294,68 @@ class PageRef:
         return f"PageRef({', '.join(parts)})"
 
 
-def page_key_to_pageref(key: str) -> PageRef:
-    """Parse a search-agent page key `"<stem>_<page>"` into a `PageRef`. The doc-id stem (which
-    itself contains underscores, e.g. `"combined_statement__historical__cs-1872"`) goes in the
-    `stem` slot; the trailing integer is the 1-based page index."""
-    try:
-        stem, page_str = key.rsplit("_", 1)
-        return PageRef(stem=stem, page=int(page_str))
-    except ValueError as e:
-        raise ValueError(f"page key {key!r} not in '<stem>_<page>' form") from e
+@dataclass
+class B64Image:
+    """A single rendered page image ready to pass to an LLM: MIME type + base64 data."""
+
+    mime: str
+    data: str
+
+
+def render_page_b64(
+    pdf_path: Path,
+    page_num: int,
+    *,
+    renders_dir: Path | str | None = None,
+    dpi: int = 300,
+    fmt: str = "png",
+    jpg_quality: int = 95,
+) -> B64Image | None:
+    """The single PDF-page rasterizer for the repo: render one page to in-memory image bytes via
+    PyMuPDF.
+
+    When `renders_dir` is given, a pre-rendered PNG at `<renders_dir>/<pdf_path.stem>_<page_num>.png`
+    (the page render cache; e.g. "treasury_bulletin_1951_06_57.png" for page 57 of
+    treasury_bulletin_1951_06.pdf) is served directly — skipping the PDF open. `dpi`/`fmt`/`jpg_quality` are
+    ignored for a cache hit (the cached PNG's own resolution applies); on a miss we fall back to
+    rasterizing the PDF."""
+    if renders_dir is not None:
+        cached = Path(renders_dir) / f"{pdf_path.stem}_{page_num}.png"
+        if cached.exists():
+            return B64Image(
+                mime="image/png",
+                data=base64.standard_b64encode(cached.read_bytes()).decode(),
+            )
+
+    if not pdf_path.exists():
+        return None
+    import fitz
+
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    with fitz.open(pdf_path) as doc:
+        pix = doc[page_num - 1].get_pixmap(matrix=mat)
+    if fmt == "jpg":
+        data = pix.tobytes("jpg", jpg_quality=jpg_quality)
+        mime = "image/jpeg"
+    else:
+        data = pix.tobytes("png")
+        mime = "image/png"
+
+    return B64Image(mime=mime, data=base64.standard_b64encode(data).decode())
+
+
+@dataclass(frozen=True)
+class PageSource:
+    """Dataclass with metadata for locating the filepath and page number for a given doc_id."""
+    # path to the PDF file containing this page
+    pdf_path: Path
+    # 1-indexed location of the page within the PDF
+    page_num: int
+
+
+class PageLocator(Protocol):
+    """The doc_id --> PageSource lookup for a given benchmark. Returns None if the doc_id has no renderable page."""
+    def lookup(self, doc_id: str) -> PageSource | None: ...
 
 
 # TODO: maybe make Tracer.emit() non-blocking?

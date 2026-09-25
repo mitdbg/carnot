@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-@dataclass(frozen=True)
+@dataclass
 class Question:
     """One benchmark question. `qid` is the general per-question id (OfficeQA's
     `uid` / BrowseComp-Plus's `query_id` both map onto it)."""
@@ -39,11 +39,6 @@ class AnswerOutput:
     `Retrieved.terminate_state`), which parses it into the out_of_steps/over_cost_budget/
     over_latency_budget columns. `retrieve_wall_s`/`compute_wall_s` split the answer wall time
     across the two phases (the runner also records the end-to-end `wall_s`).
-    
-    `session_id` which is a provider-side id for systems whose spend is metered externally.
-    In particular, the CodexSystem forwards its thread id to OpenRouter as `session_id`, so
-    the runner can query this question's cost/tokens from the analytics API; subagent traffic
-    is billed under the parent's id).
     """
 
     answer: str
@@ -51,7 +46,9 @@ class AnswerOutput:
     terminate_state: str | None = None
     retrieve_wall_s: float = 0.0
     compute_wall_s: float = 0.0
-    session_id: str | None = None
+    error: str | None = None
+    precompute_wall_s: float = 0.0
+    enrich_wall_s: float = 0.0
 
 
 @dataclass
@@ -72,21 +69,34 @@ class Result:
     failed: bool
     reason: str
     judge_rationale: str = ""
+    # session id generated for cost tracking Codex experiments
+    analytics_id: str = ""
+    # UTC ISO timestamps bracketing answer(); the deferred codex metering needs them for its time window
+    started_at: str = ""
+    finished_at: str = ""
     # end-to-end answer() wall time, then its retrieve()/compute() split (see AnswerOutput).
     wall_s: float = 0.0
     retrieve_wall_s: float = 0.0
     compute_wall_s: float = 0.0
+    # wall time of the collection-building agents that ran inside this question's answer(): the
+    # BootstrapAgent (precompute, first question only) and the EnrichAgent (enrich, batch-ending questions)
+    precompute_wall_s: float = 0.0
+    enrich_wall_s: float = 0.0
     # all-in cost across every caller this question (generation + embeddings), then the system's
     # own spend broken out by phase. Lets a run compare a retrieval method's cost against compute and total.
+    # `cost` includes the precompute / enrich agents' spend (they run on this question's LLM client);
+    # the two `*_cost` columns below break it out by their own agent ids.
     cost: float = 0.0
     retrieve_cost: float = 0.0
     compute_cost: float = 0.0
+    precompute_cost: float = 0.0
+    enrich_cost: float = 0.0
     total_cache_input_tokens: int = 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
-    embed_tokens: int = 0
-    embed_calls: int = 0
-    embed_cost: float = 0.0
+    total_embed_tokens: int = 0
+    total_embed_calls: int = 0
+    total_embed_cost: float = 0.0
     # why the retrieval agent's loop stopped (parsed from terminate_state); all False when it
     # finished normally or the system runs no budgeted agent.
     out_of_steps: bool = False
@@ -110,18 +120,25 @@ REPORT_FIELDS = [
     "failed",
     "reason",
     "judge_rationale",
+    "analytics_id",
+    "started_at",
+    "finished_at",
     "wall_s",
     "retrieve_wall_s",
     "compute_wall_s",
+    "precompute_wall_s",
+    "enrich_wall_s",
     "cost",
     "retrieve_cost",
     "compute_cost",
+    "precompute_cost",
+    "enrich_cost",
     "total_cache_input_tokens",
     "total_input_tokens",
     "total_output_tokens",
-    "embed_tokens",
-    "embed_calls",
-    "embed_cost",
+    "total_embed_tokens",
+    "total_embed_calls",
+    "total_embed_cost",
     "out_of_steps",
     "over_cost_budget",
     "over_latency_budget",

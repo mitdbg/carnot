@@ -31,7 +31,7 @@ and invoked from model-emitted python.
 Structured returns: every retrieval tool returns a *tagged dict* (never a bare
 string — errors are carried in an "error" field of the tagged payload) so the
 return shape is uniform. Each chunk carries its `chunk_id` / `doc_id`, which
-`SearchAgent._blocks_from_output` turns into `ChunkBlock`s: this keeps the
+`SearchAgent._handle_tool_call` turns into `ChunkBlock`s: this keeps the
 full trajectory for reward computation while redacting pruned chunks from the
 generation view. The tag constants below discriminate each payload shape.
 The final answer is a JSON block (handled by the agent loop), not a tool.
@@ -59,7 +59,7 @@ from typing import TYPE_CHECKING
 from chromadb.api.models.Collection import Collection
 from jinja2 import Environment, StrictUndefined
 
-from skunk.common import estimate_tokens, page_key_to_pageref, render_page_b64
+from skunk.common import PageLocator, estimate_tokens, render_page_b64
 from skunk.config import SearchAgentConfig
 from skunk.agents.multi_turn_agent import Tool
 from skunk.prompts import load_prompts
@@ -151,6 +151,7 @@ class SearchCorpusTool(Tool):
         llm_client: LLMClient,
         working_set: WorkingSet,
         usage_key: str = "default",
+        timeout_s: float | None = None,
         working_set_collection_off: bool = False,
         id_tracking_off: bool = False,
     ):
@@ -158,6 +159,7 @@ class SearchCorpusTool(Tool):
         self._llm_client = llm_client
         self._working_set = working_set
         self._usage_key = usage_key
+        self._timeout_s = timeout_s
         self._working_set_collection_off = working_set_collection_off
         self._id_tracking_off = id_tracking_off
         self.doc = _ENV.from_string(self.doc_template).render(
@@ -169,7 +171,7 @@ class SearchCorpusTool(Tool):
         """Embed `query` with the same model that produced the stored embeddings, via the
         LLMClient — which owns backend dispatch (OpenRouter / vLLM), the process-wide "embed"
         rate bucket, retry, and usage accounting."""
-        return self._llm_client.embed_query(query, usage_key=self._usage_key)
+        return self._llm_client.embed_query(query, usage_key=self._usage_key, timeout_s=self._timeout_s)
 
     def __call__(
         self,
@@ -532,10 +534,6 @@ class ViewFigureTool(Tool):
     the page text contains a `<figure id=N>` placeholder — and hand it back as an image
     observation. We render the *whole* page (not a bbox crop) so the agent sees any
     figures in context, and so OCR coordinate errors can't clip a chart.
-    
-    Preconditions:
-        - the `doc_id` obeys the format "{document_stem}_{page_num}"
-        - the "{document_stem}.pdf" lives at `pdf_dir` OR "{document_stem}.{fmt}" lives at `renders_dir`
     """
 
     name = "view_figure"
@@ -544,37 +542,32 @@ class ViewFigureTool(Tool):
     def __init__(
         self,
         document_map: DocumentMap,
-        pdf_dir: str | Path,
+        page_locator: PageLocator,
         *,
         renders_dir: str | Path | None = None,
         dpi: int = 300,
         fmt: str = "png",
     ):
         self._document_map = document_map
-        self._pdf_dir = pdf_dir
+        self._page_locator = page_locator
         self._renders_dir = renders_dir
         self._dpi = dpi
         self._fmt = fmt
 
     def __call__(self, doc_id: str) -> dict:
         # return an error if the agent caller hallucinated the doc_id
-        if doc_id not in self._document_map.get(doc_id):
+        if doc_id not in self._document_map:
             return {VIEW_FIGURE_RESULT_TAG: True, "tool": self.name, "tool_kwargs": {"doc_id": doc_id}, "error": f"no such document: {doc_id!r}"}
 
-        # return an error if the doc_id is not well-formed: "{document_stem}_{page_num}"
-        try:
-            ref = page_key_to_pageref(doc_id)
-        except ValueError:
-            return {
-                VIEW_FIGURE_RESULT_TAG: True,
-                "tool": self.name,
-                "tool_kwargs": {"doc_id": doc_id},
-                "error": f"doc_id {doc_id!r} is not a parseable page key for this corpus",
-            }
+        # lookup the PageSource with the page locator
+        page_source = self._page_locator.lookup(doc_id)
+        if page_source is None:
+            return {VIEW_FIGURE_RESULT_TAG: True, "tool": self.name, "tool_kwargs": {"doc_id": doc_id}, "error": f"No page image available for this doc_id: {doc_id!r}"}
+
         try:
             img = render_page_b64(
-                ref.stem, ref.page,
-                pdf_dir=self._pdf_dir, renders_dir=self._renders_dir, dpi=self._dpi, fmt=self._fmt,
+                page_source.pdf_path, page_source.page_num,
+                renders_dir=self._renders_dir, dpi=self._dpi, fmt=self._fmt,
             )
         except Exception as e:
             return {VIEW_FIGURE_RESULT_TAG: True, "tool": self.name, "tool_kwargs": {"doc_id": doc_id}, "error": f"view_figure render error: {e}"}
@@ -712,7 +705,7 @@ class SemanticFilterTool(Tool):
     def _vector_search_selection(self, search_str: str, top_k: int, where: dict | None, fetch: bool) -> tuple[list[tuple], list[str]]:
         """Use vector search to return a set of candidates and candidate ids."""
         working_set_collection_on = not self._working_set_collection_off
-        emb = self._llm_client.embed_query(search_str, usage_key=self._usage_key)
+        emb = self._llm_client.embed_query(search_str, usage_key=self._usage_key, timeout_s=self._config.request_timeout_s)
         query_kwargs: dict = {
             "query_embeddings": [emb],
             "n_results": top_k,
@@ -790,7 +783,7 @@ class SemanticFilterTool(Tool):
         overhead_tokens = self._config.semantic_filter_max_output_tokens + estimate_tokens(
             self._SEMFILTER_JUDGE_PROMPT + self._JUDGE_USER_WRAPPER + predicate
         )
-        budget_tokens = self._context_limit * self._config.semantic_filter_context_safety_frac - overhead_tokens
+        budget_tokens = self._context_limit * self._config.semantic_filter_context_frac - overhead_tokens
         return max(0, int(budget_tokens))
 
     def _judge_one(self, predicate: str, item_text: str) -> bool:
@@ -809,6 +802,7 @@ class SemanticFilterTool(Tool):
                 max_output_tokens=self._config.semantic_filter_max_output_tokens,
                 disable_reasoning=self._config.semantic_filter_disable_reasoning,
                 usage_key=self._usage_key,
+                timeout_s=self._config.request_timeout_s,
             )
         except Exception:
             return True  # recall-safe: keep on error

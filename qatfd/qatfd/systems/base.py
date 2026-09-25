@@ -62,13 +62,14 @@ class CodeAnswerAgent(MultiTurnAgent):
         return step_output
 
     def __init__(self, config: AgentConfig, answer_format_hint: str) -> None:
-        # override the config name to match the agent name
+        # override the config name and imports
         config.name = self.name
+        config.authorized_imports = list(self.authorized_imports)
 
         # construct the system prompt
         system_prompt_template = _PROMPTS["compute_agent_system_prompt"]
         system_prompt = _ENV.from_string(system_prompt_template).render(
-            authorized_imports=list(set(BASE_BUILTIN_MODULES) | set(self.authorized_imports)),
+            authorized_imports=list(set(BASE_BUILTIN_MODULES) | set(config.authorized_imports)),
             max_steps=config.max_steps,
             answer_format_hint=answer_format_hint,
         )
@@ -92,7 +93,7 @@ class System(ABC):
         ...
 
     @abstractmethod
-    async def answer(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext, session_id: str) -> AnswerOutput:
+    async def answer(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext, analytics_id: str) -> AnswerOutput:
         ...
 
 
@@ -123,6 +124,13 @@ class RetrieveComputeSystem(System):
     def compute_usage_key(self) -> str:
         return self.compute_config.agent_id
 
+    @property
+    def extra_usage_keys(self) -> dict[str, str]:
+        """{phase: usage key} of any further agents the system runs inside answer() (e.g. the
+        SearchAgentSystem's precompute / enrich collection agents), so the runner can break their
+        cost out of the all-in per-question `cost`. Default: none."""
+        return {}
+
     @abstractmethod
     async def retrieve(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext) -> Retrieved:
         ...
@@ -134,13 +142,14 @@ class RetrieveComputeSystem(System):
             answer_format_hint=resources.answer_format_hint,
         )
         context = r.context if r.context is not None else _docs_to_context(r.doc_ids, resources.document_map)
-        payload = await agent.call(ctx, f"Question: {q.text}\n\nDocuments:\n{context}")
+        question_text = q.text if q.text.lower().startswith("question:") else f"Question: {q.text}"
+        payload = await agent.call(ctx, f"{question_text}\n\nDocuments:\n{context}")
         if isinstance(payload, dict) and payload.get("answer") is not None:
             return str(payload["answer"])
 
         return ""
 
-    async def answer(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext, session_id: str) -> AnswerOutput:
+    async def answer(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext, analytics_id: str) -> AnswerOutput:
         t0 = time.monotonic()
         r = await self.retrieve(q, resources, ctx)
         t1 = time.monotonic()

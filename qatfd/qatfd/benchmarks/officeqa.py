@@ -17,8 +17,9 @@ import re
 import pandas as pd
 
 from jinja2 import Environment, StrictUndefined
+from pathlib import Path
 
-from skunk.common import ExecutionContext
+from skunk.common import ExecutionContext, PageLocator, PageSource
 
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.officeqa_scoring import SCORER_VERSION, score_correct
@@ -45,6 +46,21 @@ _URL_RE = re.compile(
     r"-(?P<year>\d{4})[^?]*\?page=(?P<page>\d+)",
     re.IGNORECASE,
 )
+
+class OfficeQAPageLocator(PageLocator):
+    """Returns the PDF page for a given OfficeQA doc_id."""
+
+    def __init__(self, pdf_dir: Path):
+        self._pdf_dir = pdf_dir
+
+    def lookup(self, doc_id: str) -> PageSource | None:
+        try:
+            year, month, page_num = doc_id.split("_")
+            pdf_path = self._pdf_dir / f"treasury_bulletin_{year}_{month}.pdf"
+        except:
+            return None
+
+        return PageSource(pdf_path=pdf_path, page_num=int(page_num))
 
 
 def _parse_gold_page_keys(source_docs: str) -> list[str]:
@@ -73,16 +89,10 @@ class OfficeQABenchmark(Benchmark):
     name = OFFICE_QA
     config: OfficeQAConfig
 
-    # The cup scorer extracts the final answer from a <FINAL_ANSWER> wrapper and
-    # numerically compares it to a BARE gold value (digits, optional sign / decimal /
-    # thousands-commas / a trailing %; lists like [1.2, 3.4]). It does NOT strip unit
-    # or magnitude words, so "4962.46 million dollars" or "0.0 percentage points" score
-    # wrong even when numerically right — the hint must forbid them.
     answer_format_hint = (
-        "Wrap your final answer in <FINAL_ANSWER>...</FINAL_ANSWER> tags with no working "
-        "or explanation. Inside the tags put ONLY the bare value, expressed in the units "
-        "the question specifies: just the number, with no unit words, currency symbols, or "
-        "magnitude words — write 4962.46, not '4962.46 million dollars', '$4,962,460,000', "
+        "Return your final answer without an explanation. Return ONLY the bare value, expressed "
+        "in the units the question specifies: just the number, with no unit words, currency "
+        "symbols, or magnitude words — write 4962.46, not '4962.46 million dollars', '$4,962,460,000', "
         "or '4962.46 USD' (a percentage may use a trailing '%' but not the word 'percent'). "
         "If several values are requested, list them in brackets like [1.2, 3.4]. For a "
         "non-numeric answer, give the date or short phrase alone."
@@ -154,16 +164,18 @@ class OfficeQABenchmark(Benchmark):
         return document_map
 
     def _build_resources(self) -> BenchmarkResources:
-        collection = self._open_chroma_collection()
+        collection, client = self._open_chroma_collection()
         document_map = self._build_document_map()
-
+        page_locator = OfficeQAPageLocator(Path(self.config.storage.pdf_dir)) if self.config.storage.pdf_dir else None
         return BenchmarkResources(
             name=self.name,
             chroma_collection=collection,
+            chroma_client=client,
             document_map=document_map,
             answer_format_hint=self.answer_format_hint,
             compute_objective=self.compute_objective,
             corpus_details=self.corpus_details,
+            page_locator=page_locator,
         )
 
     async def score(self, question: Question, predicted: str, ctx: ExecutionContext) -> dict:

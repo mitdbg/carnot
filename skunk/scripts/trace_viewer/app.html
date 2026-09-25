@@ -187,6 +187,31 @@
     .sf-chip.open { outline:1px solid var(--text3); }
     .sf-chip:hover { filter:brightness(1.3); }
     .sf-text { flex-basis:100%; font-family: ui-monospace, monospace; font-size:11px; line-height:1.5; white-space:pre-wrap; word-break:break-word; padding:6px 9px; margin:0 0 2px; border-left:2px solid var(--border2); color: var(--text2); max-height:360px; overflow:auto; }
+    /* qatfd: agent_step traces — one collapsible card per agent run in a question */
+    .runcard > summary { list-style:none; cursor:pointer; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .runcard > summary::-webkit-details-marker { display:none; }
+    .runcard > summary .card-title { margin-bottom:0; }
+    .runcard[open] > summary { margin-bottom:10px; }
+    .run-stats { display:inline-flex; gap:6px; flex-wrap:wrap; margin-left:auto; }
+    .runtab { width:100%; border-collapse:collapse; font-size:11px; font-family: ui-monospace, monospace; }
+    .runtab th { text-align:left; color:var(--text3); font-weight:600; letter-spacing:0.6px; text-transform:uppercase; font-size:9px; padding:3px 8px; border-bottom:1px solid var(--border); }
+    .runtab td { padding:4px 8px; border-bottom:1px solid var(--border); color:var(--text2); white-space:nowrap; }
+    .runtab td.num { text-align:right; }
+    .runtab tr:last-child td { border-bottom:none; }
+    .run-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+    .tmetric.tctx { color: var(--yellow); }
+    /* structured tool-call payload (what the tool returned) shown above the observation the agent saw */
+    .tc { border:1px solid var(--border2); border-left:3px solid var(--blue); border-radius:4px; background:rgba(0,30,60,0.15); padding:6px 10px; margin:6px 0; }
+    .tc-head { display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; font-size:11px; }
+    .tc-tool { color: var(--blue); font-weight:700; font-family: ui-monospace, monospace; }
+    .tc-kw { color: var(--text3); font-size:10px; white-space:pre-wrap; word-break:break-word; }
+    .tc-sum { font-size:11px; color: var(--text2); margin-top:3px; }
+    .tc-chips { margin-top:4px; }
+    .subcalls { font-family: ui-monospace, monospace; font-size:11px; color: var(--text3); padding:3px 10px; border-left:2px solid var(--border2); margin:2px 0; }
+    .pass-nav { display:flex; gap:8px; flex-wrap:wrap; align-items:baseline; margin:4px 0 10px; font-size:11px; color:var(--text3); }
+    .pass-link { display:inline-block; font-family: ui-monospace, monospace; font-size:11px; padding:2px 9px; border-radius:4px; border:1px solid var(--border2); background:var(--bg3); color:var(--text2); cursor:pointer; }
+    .pass-link:hover { border-color: var(--green); color: var(--text); }
+    .notice { border-left:3px solid var(--yellow); background: var(--yellow-bg); color: var(--yellow); font-size:11px; padding:4px 10px; margin:4px 0; border-radius:0 4px 4px 0; white-space:pre-wrap; }
   </style>
 </head>
 <body>
@@ -224,11 +249,15 @@ const KIND = {
   // harness lifecycle: low-steps warnings + the forced terminal turn after max steps.
   // Purple so it reads as neither an agent action (green) nor an observation (blue).
   lifecycle:   { color:"#cc66ff", bg:"var(--purple-bg)",  label:"LIFECYCLE" },
+  // agent_step traces: structured tool payloads and background bookkeeping (working-set lookups)
+  tool_call:   { color:"#3399ff", bg:"transparent",      label:"TOOL CALL" },
+  background:  { color:"#888888", bg:"transparent",      label:"BACKGROUND" },
 };
 // Lifecycle events the harness injected/took. New traces tag them kind="lifecycle";
 // old traces carry note/error — match on the leading event key too so both render alike.
 const LIFECYCLE_PREFIXES = new Set(["steps_low_warning","terminal_prompt","terminal_reply","terminal_commit","terminal_giveup","terminal_turn_failed"]);
-const evtKey = (e) => String(e.message || "").split(" ", 1)[0];
+// new traces carry the event key in `id` (message is often null); old traces lead the message with it
+const evtKey = (e) => e.id || String(e.message || "").split(" ", 1)[0];
 const isLifecycle = (e) => e.kind === "lifecycle" || LIFECYCLE_PREFIXES.has(evtKey(e));
 // human labels for the lifecycle card header, keyed by event key
 const LIFECYCLE_LABEL = {
@@ -238,9 +267,24 @@ const LIFECYCLE_LABEL = {
   terminal_commit:    "terminal — committed answer",
   terminal_giveup:    "terminal — gave up",
   terminal_turn_failed:"terminal — turn errored",
+  doc_ids_validated:  "doc ids validated (kept / dropped)",
+  doc_id_correction:  "doc-id correction — re-prompt",
+  trajectory_collection_dropped: "trajectory collection dropped (working sets off)",
 };
 const OP_COLOR = { planner:"#cc66ff", retrieve:"#3399ff", extract:"#e6b800", lookup_external:"#ff9933", compute:"#33cc33", replanner:"#ff66aa" };
-const COMPACT_KINDS = new Set(["call", "note", "step"]);
+const COMPACT_KINDS = new Set(["call", "note", "step", "background"]);
+// compact-line text for a new-format event whose message is null: LLM calls carry their envelope in
+// `data`; background events (working-set lookups) carry a small dict.
+function compactLine(evt){
+  if(evt.message) return evt.message;
+  const d = evt.data || {};
+  if(evt.kind === "call" && d.call_site){
+    return `call ${d.call_site} model=${d.model} ${d.latency_s!=null?(+d.latency_s).toFixed(2)+"s":""} in=${d.in_tok??"?"} out=${d.out_tok??"?"}`
+      + (d.think_tok ? ` think=${d.think_tok}` : "") + (d.cost!=null ? ` $${(+d.cost).toFixed(5)}` : "");
+  }
+  return `${evt.id || evt.kind} ${Object.keys(d).length ? JSON.stringify(d) : ""}`;
+}
+const fk = (n) => n==null ? "?" : (n>=1e6 ? (n/1e6).toFixed(2)+"M" : n>=1e3 ? (n/1e3).toFixed(1)+"k" : String(Math.round(n)));
 const TRUNC_CHARS = 40000;   // ~10k tokens — observations longer than this collapse with a click-to-expand
 
 const S = { run:null, questions:[], qByUid:{}, uid:null, events:[], row:null, activeRev:0, expanded:new Set() };
@@ -258,6 +302,7 @@ const showLifecycle = () => document.getElementById("show-lifecycle").checked;
 window.VW = {
   toggleExpand(key){ if(S.expanded.has(key)) S.expanded.delete(key); else S.expanded.add(key); draw(); },
   setRev(i){ S.activeRev = i; draw(); },
+  goto(uid){ const q = document.getElementById("q-sel"); q.value = uid; loadQuestion(uid); },
 };
 
 // ── boot / load ─────────────────────────────────────────────────────────────
@@ -316,7 +361,9 @@ async function loadRun(run){
     const raw = q.score != null ? q.score : q.correct;
     const correct = parseFloat(raw) >= 1 || String(raw).toLowerCase()==="true";
     const mark = correct ? "✓" : "✗";
-    return `<option value="${esc(q.uid)}">${mark} ${esc(q.uid)} — ${esc((q.question||"").slice(0,90))}</option>`;
+    // multi-pass runs repeat each qid once per pass: label by qid + pass, not the composite uid
+    const label = q.pass ? `${q.qid || q.uid} · pass ${q.pass}` : q.uid;
+    return `<option value="${esc(q.uid)}">${mark} ${esc(label)} — ${esc((q.question||"").slice(0,90))}</option>`;
   }).join("");
   if(S.questions.length){ qSel.value = S.questions[0].uid; await loadQuestion(S.questions[0].uid); }
   else document.getElementById("content").innerHTML = `<div class="hint">No questions in this run.</div>`;
@@ -794,7 +841,7 @@ function eventHtml(evt){
     // Compact events are scannable one-liners by convention, but a message can embed a blob
     // (e.g. an llm_call_failed `raw_body=` full of newlines from a finish_reason=length reply);
     // with white-space:pre-wrap that renders as a huge blank gap, so collapse whitespace runs.
-    const line = esc((evt.message || "").replace(/\s+/g, " ").trim());
+    const line = esc(compactLine(evt).replace(/\s+/g, " ").trim());
     return `<div class="msg compact" style="border-left-color:${style.color}"><div class="msg-line">${ts?`<span style="color:var(--text3)">${ts} </span>`:""}${line}</div></div>`;
   }
   const key = String(evt._idx); const expanded = S.expanded.has(key);
@@ -838,11 +885,15 @@ function renderBody(evt, expanded){
     }
     return { html: out.join(""), total, truncated:true };
   }
-  const text = typeof d.text === "string" ? d.text : (evt.message || "");
+  // a payload-only event (e.g. doc_ids_validated {kept, dropped}) renders its dict when it has no text
+  const text = typeof d.text === "string" ? d.text : (evt.message || (Object.keys(d).length ? JSON.stringify(d, null, 1) : ""));
   if(text.length <= TRUNC_CHARS || expanded) return { html:`<div class="msg-text">${esc(text)}</div>`, total:text.length, truncated:false };
   return { html:`<div class="msg-text">${esc(text.slice(0,TRUNC_CHARS))} …</div>`, total:text.length, truncated:true };
 }
 function blockHtml(b){
+  if(b && b.type === "image"){
+    return `<div class="msg-text" style="color:var(--text3)">[image of doc_id=${esc(b.doc_id ?? "")}${b.text?` — ${esc(b.text)}`:""}]</div>`;
+  }
   if(b && b.type === "chunk"){
     return `<div class="chunk"><div class="chunk-meta">chunk_id=${esc(b.chunk_id ?? "")} · doc_id=${esc(b.doc_id ?? "")}</div><pre class="chunk-text">${esc(b.text ?? "")}</pre></div>`;
   }
@@ -887,6 +938,18 @@ function qaHeaderHtml(){
   if(row.benchmark) meta.push(pill("benchmark", row.benchmark));
   if(wall!=null)    meta.push(pill("wall", fsec(wall)));
   if(row.cost!=null && row.cost!=="") meta.push(pill("cost", "$"+Number(row.cost).toFixed(4)));
+  if(row.pass)  meta.push(pill("pass", row.pass + (row.order ? ` · #${row.order}` : "")));
+  // per-phase spend / wall of the qatfd runner: the search agent (retrieve), the shared answerer
+  // (compute) and the collection agents that ran inside this question's answer() (precompute = bootstrap,
+  // enrich). Zero phases are skipped so a plain run shows nothing extra.
+  const usd = (v) => "$"+Number(v).toFixed(4);
+  for(const [k, label] of [["retrieve_cost","retrieve cost"],["compute_cost","compute cost"],["precompute_cost","bootstrap cost"],["enrich_cost","enrich cost"]]){
+    if(row[k]!=null && row[k]!=="" && Number(row[k])>0) meta.push(pill(label, usd(row[k])));
+  }
+  for(const [k, label] of [["retrieve_wall_s","retrieve"],["compute_wall_s","compute"],["precompute_wall_s","bootstrap"],["enrich_wall_s","enrich"]]){
+    if(row[k]!=null && row[k]!=="" && Number(row[k])>0) meta.push(pill(label+" wall", fsec(row[k])));
+  }
+  if(row.total_input_tokens!=null && row.total_input_tokens!=="") meta.push(pill("tokens", `${fk(+row.total_input_tokens)} in · ${fk(+row.total_output_tokens)} out`));
 
   const kv = [];
   if(row.predicted)   kv.push(rowKV("predicted", stripFinalAnswer(row.predicted)));
@@ -898,9 +961,16 @@ function qaHeaderHtml(){
   kv.push(`<div class="kv"><span class="k">groundtruth docs</span><span class="v">${goldChipsH}</span></div>`);
   kv.push(`<div class="kv"><span class="k">retrieved docs</span><span class="v">${retrChipsH}</span></div>`);
 
+  // multi-pass runs: the same qid in the other passes, one click away, with the numbers that
+  // matter for a pass-over-pass read (score, retrieval spend, retrieval wall)
+  const siblings = row.qid ? S.questions.filter(q => q.qid===row.qid && q.uid!==row.uid) : [];
+  const passNav = siblings.length ? `<div class="pass-nav"><span>same question, other pass(es):</span>${siblings.map(q =>
+      `<span class="pass-link" onclick="VW.goto('${esc(q.uid)}')">pass ${esc(q.pass)} · score ${Number(q.score).toFixed(2)} · retrieve ${usd(q.retrieve_cost||0)} · ${fsec(q.retrieve_wall_s||0)}</span>`).join("")}</div>` : "";
+
   return `<div class="card">
-    <div class="card-title">${esc(row.uid)} ${badge}</div>
+    <div class="card-title">${esc(row.qid || row.uid)}${row.pass ? ` · pass ${esc(row.pass)}` : ""} ${badge}</div>
     ${meta.length ? `<div class="metabar">${meta.join("")}</div>` : ""}
+    ${passNav}
     <div class="q-text">${esc(row.question || "(question text unavailable — no report.csv)")}</div>
     ${kv.join("")}
   </div>`;
@@ -1125,9 +1195,231 @@ function nuggetCard(evt){
   </div>`;
 }
 
+// ── qatfd agent_step traces (the post-refactor MultiTurnAgent) ───────────────
+// The loop emits one `assistant`/agent_step event per step — the model text, the parsed tool code,
+// the observation blocks the agent actually saw, and its budgets — preceded by that step's LLM `call`
+// events and the structured `tool_call` payloads. Every agent run opens with `system_prompt` +
+// `question`, and one question can hold several runs back to back: the SearchAgentSystem runs the
+// BootstrapAgent before the first question, then the search agent, the code answerer, and the
+// EnrichAgent after a batch — all on the question's tracer. Runs are split at each system prompt and
+// labelled by the call_site of their first LLM call.
+const isStepTrace = (events) => events.some(e => e.id === "agent_step");
+const RUN_LABEL = {
+  bootstrap:            "Bootstrap — collection agent (ran before the first question)",
+  search_agent:         "Retrieval — search agent",
+  compute_answer_agent: "Answer — code agent",
+  enrich:               "Enrich — collection agent (ran after this question)",
+};
+const RUN_COLOR = { bootstrap:"#cc66ff", search_agent:"#3399ff", compute_answer_agent:"#33cc33", enrich:"#ff9933" };
+const runLabel = (site) => RUN_LABEL[site] || `Agent — ${site}`;
+const runColor = (site) => RUN_COLOR[site] || "#999999";
+
+// A resumed call (the search agent's doc-id correction re-prompt) re-emits the same system prompt, so a
+// run whose prompt equals the previous run's folds into it (its `question` becomes a re-prompt card).
+function splitAgentRuns(events){
+  const pre = [], runs = []; let cur = null;
+  for(const e of events){
+    if(e.kind === "system"){
+      const text = e.data && e.data.text;
+      if(cur && cur.systemText === text){ cur.events.push(e); continue; }
+      cur = { systemText:text, site:null, events:[e] }; runs.push(cur); continue;
+    }
+    if(!cur){ pre.push(e); continue; }
+    cur.events.push(e);
+    if(!cur.site && e.id === "call" && e.data && e.data.call_site) cur.site = e.data.call_site;
+  }
+  runs.forEach((r,i) => { if(!r.site) r.site = i===0 ? "search_agent" : "unknown"; });
+  return { pre, runs };
+}
+function runStats(run){
+  const calls = run.events.filter(e => e.id==="call" && e.data && e.data.call_site);
+  const steps = run.events.filter(e => e.id==="agent_step");
+  const sum = (k) => calls.reduce((s,c)=>s+(+c.data[k]||0), 0);
+  const ts = run.events.map(e => e.t).filter(t => t!=null);
+  const last = steps[steps.length-1];
+  return {
+    nSteps: steps.length, maxSteps: last && last.data ? last.data.max_steps : null,
+    nCalls: calls.length, nSub: calls.filter(c => c.data.call_site!==run.site).length,
+    cost: sum("cost"), inTok: sum("in_tok"), outTok: sum("out_tok"),
+    wall: ts.length ? Math.max(...ts) - Math.min(...ts) : null,
+    term: last && last.data ? last.data.terminate_state : null,
+    failedTools: run.events.filter(e => e.kind==="tool_call" && e.data && e.data.error).length,
+  };
+}
+// one row per agent run: where the question's time and money went
+function runOverviewHtml(runs){
+  const rows = runs.map(r => { const st = runStats(r); return `<tr>
+    <td><span class="run-dot" style="background:${runColor(r.site)}"></span>${esc(runLabel(r.site))}</td>
+    <td class="num">${st.nSteps}${st.maxSteps?`/${st.maxSteps}`:""}</td>
+    <td class="num">${st.nCalls.toLocaleString()}${st.nSub?` <span style="color:var(--text3)">(${st.nSub.toLocaleString()} judge/embed)</span>`:""}</td>
+    <td class="num">${fk(st.inTok)} / ${fk(st.outTok)}</td>
+    <td class="num">${fusd(st.cost)}</td>
+    <td class="num">${st.wall!=null ? fsec(st.wall) : "?"}</td>
+    <td>${esc(st.term || "")}${st.failedTools?` <span style="color:var(--red)">${st.failedTools} tool error(s)</span>`:""}</td></tr>`; }).join("");
+  return `<div class="card"><div class="card-title">Agent runs in this question</div>
+    <table class="runtab"><thead><tr><th>run</th><th>steps</th><th>LLM calls</th><th>tokens in / out</th><th>cost</th><th>wall</th><th>ended</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+// turns of one run: each agent_step closes a turn holding the calls / tool payloads / re-prompts before it
+function groupStepTurns(events){
+  const pre = [], turns = []; let pending = [], pendingLife = [];
+  for(const e of events){
+    if(e.kind === "system" || e.kind === "user"){ (turns.length ? pending : pre).push(e); continue; }
+    if(isLifecycle(e)){ pendingLife.push(e); continue; }
+    if(e.id === "agent_step"){ turns.push({ lead:pending, before:pendingLife, step:e }); pending = []; pendingLife = []; continue; }
+    pending.push(e);
+  }
+  return { pre, turns, tail:pending, tailLife:pendingLife };
+}
+// the structured payload a tool returned (ids / counts / errors), shown above the observation text
+function toolCallHtml(e, gold){
+  const d = e.data || {}, tool = d.tool || e.id, kw = d.tool_kwargs || {};
+  const docChips = (ids) => { const u = [...new Set(ids)];
+    return u.slice(0,60).map(id => `<span class="chip ${gold.has(id)?"chip-gold":"chip-retr"}">${esc(id)}</span>`).join("")
+      + (u.length>60 ? `<span class="chip chip-none">+${u.length-60} more</span>` : ""); };
+  let summary = "", chips = "";
+  if(d.error){ summary = `<span style="color:var(--red)">${esc(d.error)}</span>`; }
+  else if(Array.isArray(d.results)){          // search / grep / semantic_filter: chunk hits
+    const docs = d.results.map(r => r.doc_id), colls = [...new Set(d.results.map(r => r.collection))];
+    summary = `${d.results.length} chunk(s) · ${new Set(docs).size} doc(s)${colls.length?` · from ${colls.map(esc).join(", ")}`:""}`;
+    if(d.kept_doc_ids) summary += ` · kept ${(d.kept_doc_ids||[]).length}, rejected ${(d.rejected_doc_ids||[]).length}`;
+    chips = docChips(docs);
+  }
+  else if(Array.isArray(d.doc_ids)){ summary = `${d.doc_ids.length} doc(s)`; chips = docChips(d.doc_ids); }
+  else if(d.collection && d.num_chunks!=null){ const st = d.stats || {};
+    summary = `<b>${esc(d.collection)}</b>: ${Number(d.num_chunks).toLocaleString()} chunk(s)`
+      + (st.n_new!=null ? ` · this call: +${st.n_new} new, ${st.n_existing} existing, ${st.n_missing} missing, ${st.n_docs} doc(s)` : ""); }
+  else if(d.collection){ summary = `<b>${esc(d.collection)}</b>`; }
+  else if(d.results && typeof d.results === "object"){   // semantic_map / map_collections: per-collection counts
+    summary = Object.entries(d.results).map(([c,r]) => r.error ? `${esc(c)}: <span style="color:var(--red)">${esc(r.error)}</span>`
+      : `${esc(c)}: ${Number(r.n_mapped).toLocaleString()} mapped${r.n_failed?`, <span style="color:var(--red)">${r.n_failed} failed</span>`:""}`).join(" · ");
+    if(d.warning) summary += ` <span style="color:var(--yellow)">${esc(d.warning)}</span>`; }
+  else if(Array.isArray(d.collections)){ summary = d.collections.map(c => `${esc(c.name)} (${Number(c.num_chunks).toLocaleString()})`).join(", "); }
+  else if(d.doc_id){ summary = `doc_id=${esc(d.doc_id)}${d.mime?` · ${esc(d.mime)}`:""}`; }
+  const kwStr = Object.entries(kw).filter(([k,v]) => v!=null && k!=="map_fn").map(([k,v]) => `${k}=${typeof v==="string" ? v : JSON.stringify(v)}`).join(", ");
+  return `<div class="tc"><div class="tc-head"><span class="tc-tool">${esc(tool)}</span><span class="tc-kw">${esc(kwStr.length>600 ? kwStr.slice(0,600)+" …" : kwStr)}</span></div>
+    ${summary ? `<div class="tc-sum">${summary}</div>` : ""}${chips ? `<div class="tc-chips">${chips}</div>` : ""}</div>`;
+}
+// judge / embedding calls a tool fired inside a step (thousands for a semantic_map): one line per call site
+function subCallsHtml(calls){
+  const by = new Map();
+  for(const c of calls){ const d = c.data; const g = by.get(d.call_site) || { n:0, cost:0, inTok:0, outTok:0, lat:0 };
+    g.n++; g.cost += +d.cost||0; g.inTok += +d.in_tok||0; g.outTok += +d.out_tok||0; g.lat += +d.latency_s||0; by.set(d.call_site, g); }
+  return [...by.entries()].map(([site,g]) => `<div class="subcalls">↳ ${g.n.toLocaleString()} ${esc(site)} call(s) · ${fusd(g.cost)} · ${fk(g.inTok)} in / ${fk(g.outTok)} out · ${fsec(g.lat)} summed</div>`).join("");
+}
+function blocksCard(blocks, key){
+  const expanded = S.expanded.has(key);
+  const total = blocks.reduce((n,b) => n + ((b && b.text) || "").length, 0);
+  let html, truncated = false;
+  if(total <= TRUNC_CHARS || expanded) html = blocks.map(blockHtml).join("") || `<span class="empty">empty</span>`;
+  else { let used = 0; const out = [];
+    for(const b of blocks){ const len = ((b && b.text) || "").length;
+      if(used+len <= TRUNC_CHARS){ out.push(blockHtml(b)); used += len; }
+      else { out.push(blockHtml({ ...b, text: ((b && b.text) || "").slice(0, Math.max(0, TRUNC_CHARS-used)) + " …" })); break; } }
+    html = out.join(""); truncated = true; }
+  const btn = (truncated || (expanded && total>TRUNC_CHARS))
+    ? `<button class="expand-btn" onclick="VW.toggleExpand('${key}')">${expanded ? "▲ collapse" : `▼ show full (~${tok(total)} tokens)`}</button>` : "";
+  const st = KIND.observation;
+  return `<div class="msg" style="border-left-color:${st.color};background:${st.bg}"><div class="msg-bar" style="color:${st.color}"><span>OBSERVATION</span><span class="meta">~${tok(total)} tok</span></div>${html}${btn}</div>`;
+}
+function textCard(st, label, text, key, meta=""){
+  const expanded = S.expanded.has(key), full = text || "";
+  const body = (full.length <= TRUNC_CHARS || expanded) ? full : full.slice(0, TRUNC_CHARS) + " …";
+  const btn = full.length > TRUNC_CHARS ? `<button class="expand-btn" onclick="VW.toggleExpand('${key}')">${expanded ? "▲ collapse" : `▼ show full (~${tok(full.length)} tokens)`}</button>` : "";
+  return `<div class="msg" style="border-left-color:${st.color};background:${st.bg}"><div class="msg-bar" style="color:${st.color}"><span>${label}</span><span class="meta">${meta}</span></div><div class="msg-text">${esc(body)}</div>${btn}</div>`;
+}
+function stepTurnHtml(turn, key, metrics, site, gold){
+  const d = turn.step.data || {}, code = d.code || "";
+  const firstLine = (code.split("\n").find(l => l.trim() && !l.trim().startsWith("#")) || "").trim();
+  const m = /([A-Za-z_]\w*)\s*\(/.exec(firstLine);
+  const toolCalls = turn.lead.filter(e => e.kind === "tool_call");
+  const agentCalls = turn.lead.filter(e => e.kind === "call" && !(e.id === "call" && e.data && e.data.call_site && e.data.call_site !== site));
+  const subCalls = turn.lead.filter(e => e.id === "call" && e.data && e.data.call_site && e.data.call_site !== site);
+  const reprompts = turn.lead.filter(e => e.kind === "user" || e.kind === "system");
+  const other = turn.lead.filter(e => !toolCalls.includes(e) && !agentCalls.includes(e) && !subCalls.includes(e) && !reprompts.includes(e));
+  const badges = [];
+  if(m) badges.push(`<span class="op-badge" style="background:#3399ff22;color:#3399ff">${esc(m[1])}</span>`);
+  if(d.is_final) badges.push(`<span class="op-badge" style="background:#33cc3322;color:#33cc33">final answer</span>`);
+  if(d.error) badges.push(`<span class="op-badge" style="background:#ff444422;color:#ff4444">error</span>`);
+  if(toolCalls.some(e => e.data && e.data.error)) badges.push(`<span class="op-badge" style="background:#ff444422;color:#ff4444">tool error</span>`);
+  if(d.notice) badges.push(`<span class="op-badge" style="background:#e6b80022;color:#e6b800">notice</span>`);
+  const stepNo = d.step ?? turn.step.step;
+  const stepLabel = stepNo!=null ? `step ${stepNo}${d.max_steps ? "/"+d.max_steps : ""}` : "turn";
+  const preview = d.is_final ? String(d.result || "") : (firstLine || (d.text || "").split("\n")[0]);
+  const ctx = d.tokens_in_context!=null
+    ? `<span class="tmetric tctx"><span class="tm-k">ctx</span>${fk(d.tokens_in_context)}${d.context_limit?`<span class="tm-sep">/</span>${fk(d.context_limit)}`:""}</span>` : "";
+  const parts = [];
+  parts.push(reprompts.map(eventHtml).join(""));
+  parts.push(agentCalls.map(eventHtml).join(""));
+  parts.push(textCard(KIND.assistant, "ASSISTANT", d.text == null ? "(no model output)" : d.text, key+":a", d.step_latency_s!=null ? `step ${fsec(d.step_latency_s)}` : ""));
+  if(code) parts.push(`<div class="msg compact" style="border-left-color:#888"><div class="msg-line mono">${esc(code)}</div></div>`);
+  if(d.notice) parts.push(`<div class="notice">${esc(d.notice)}</div>`);
+  parts.push(toolCalls.map(e => toolCallHtml(e, gold)).join(""));
+  if(subCalls.length) parts.push(subCallsHtml(subCalls));
+  parts.push(other.map(eventHtml).join(""));
+  if(Array.isArray(d.observation_blocks)) parts.push(blocksCard(d.observation_blocks, key+":o"));
+  if(d.error) parts.push(textCard(KIND.error, "ERROR", d.error, key+":e"));
+  if(d.is_final && d.result!=null) parts.push(textCard(KIND.assistant, "RESULT", String(d.result), key+":r"));
+  return `<details class="node"><summary>
+      <span class="ti">▶</span>
+      <span class="node-meta">${esc(stepLabel)}</span>
+      ${badges.join("")}
+      <span class="node-summary mono">${esc(preview.slice(0,140))}</span>
+      <span class="tmetrics">${ctx}</span>${metricBadges(metrics)}
+    </summary>
+    <div class="node-body">${parts.join("")}</div>
+  </details>`;
+}
+function stepTurnsHtml(run, keyPrefix, gold){
+  const { pre, turns, tail, tailLife } = groupStepTurns(run.events);
+  const ts = run.events.map(e => e.t).filter(t => t!=null);
+  const t0 = ts.length ? Math.min(...ts) : 0;
+  let cumCost = 0, anyCost = false;
+  const parts = [];
+  if(pre.length) parts.push(pre.map(eventHtml).join(""));
+  turns.forEach((t,i) => {
+    if(t.before && t.before.length) parts.push(t.before.map(eventHtml).join(""));
+    const d = t.step.data || {};
+    const stepLat = d.step_latency_s != null ? +d.step_latency_s : null;
+    const cumLat  = t.step.t != null ? Math.max(0, t.step.t - t0) : null;
+    let stepCost = null;
+    for(const e of t.lead){ if(e.kind!=="call") continue; const c = callCostOf(e); if(c!=null){ stepCost = (stepCost||0) + c; } }
+    if(stepCost!=null){ cumCost += stepCost; anyCost = true; }
+    parts.push(stepTurnHtml(t, `${keyPrefix}:${i}`, { stepLat, cumLat, stepCost, cumCost: anyCost ? cumCost : null }, run.site, gold));
+  });
+  if(tail.length) parts.push(tail.map(e => e.kind==="tool_call" ? toolCallHtml(e, gold) : eventHtml(e)).join(""));
+  if(tailLife && tailLife.length) parts.push(tailLife.map(eventHtml).join(""));
+  return parts.join("") || `<div class="empty">no agent turns</div>`;
+}
+// one collapsible card per agent run; the collection agents start collapsed (their stats are in the
+// overview table), the retrieval + answer agents open
+function runCard(run, i, gold){
+  const st = runStats(run), color = runColor(run.site);
+  const open = !(run.site === "bootstrap" || run.site === "enrich");
+  const pill = (k,v) => `<span class="metapill"><span class="mk">${esc(k)}</span><span class="mv">${esc(v)}</span></span>`;
+  const stats = [pill("steps", `${st.nSteps}${st.maxSteps?"/"+st.maxSteps:""}`), pill("LLM calls", st.nCalls.toLocaleString()),
+    pill("cost", fusd(st.cost)), pill("tokens", `${fk(st.inTok)} in`), st.wall!=null ? pill("wall", fsec(st.wall)) : "", st.term ? pill("ended", st.term) : ""].join("");
+  return `<details class="card runcard"${open?" open":""}><summary>
+      <span class="ti">▶</span><span class="run-dot" style="background:${color}"></span><span class="card-title">${esc(runLabel(run.site))}</span>
+      <span class="run-stats">${stats}</span></summary>
+    ${stepTurnsHtml(run, `run${i}`, gold)}</details>`;
+}
+function drawSearchAgentSteps(events, nugEvt){
+  const gold = new Set(parseIdList(S.row.gold_docs));
+  const { pre, runs } = splitAgentRuns(events);
+  const parts = [qaHeaderHtml()];
+  if(nugEvt) parts.push(nuggetCard(nugEvt));
+  if(runs.length > 1) parts.push(runOverviewHtml(runs));
+  const preHtml = pre.map(eventHtml).join("");   // may be empty when its only events are toggled off (lifecycle)
+  if(preHtml) parts.push(sectionCard("Before the first agent (working-set lookups, setup)", preHtml));
+  runs.forEach((run, i) => parts.push(runCard(run, i, gold)));
+  document.getElementById("content").innerHTML = parts.join("");
+}
+
 function drawSearchAgent(sys){
   const nugEvt = S.events.find(isNuggetEvent);
   const events = nugEvt ? S.events.filter(e => e!==nugEvt) : S.events;
+  if(isStepTrace(events)) return drawSearchAgentSteps(events, nugEvt);
+  // legacy (pre-agent_step) traces: observation / note events, one retrieval + one answer stage
   const aStart = answerStartIdx(events);
   const retrieval = aStart>=0 ? events.slice(0, aStart) : events;
   const answer    = aStart>=0 ? events.slice(aStart) : [];

@@ -100,7 +100,7 @@ class AgentConfig:
     # preserving behaviour for every agent that doesn't opt in. `SearchAgent` sets
     # these to bound runaway generations and to cap genuinely hung requests.
     max_output_tokens: int | None = None
-    request_timeout_s: float | None = None
+    request_timeout_s: float | None = 120.0
     # Extra imports authorized inside the per-step code sandbox. Default: none
     # (tool calls only). Compute-oriented agents (e.g. the task solver) widen
     # this to allow numpy / scipy / statistics / ... in their python steps.
@@ -158,10 +158,10 @@ class SearchAgentConfig(AgentConfig):
     chunks_per_summary: int = 10
     # the number of workers to use to process semantic filter tool calls in parallel
     semantic_filter_max_workers: int = 16
-    # the maximum number of documents that can be processed by a single semantic filter tool call
-    semantic_filter_max_candidate_docs: int = 1000
+    # the maximum number of chunks that can be processed by a single semantic filter tool call
+    semantic_filter_max_candidate_docs: int = 1_000
     # the fraction of the semantic filter model's context window that can be used to fit document text
-    semantic_filter_context_safety_frac: float = 0.9
+    semantic_filter_context_frac: float = 0.9
     # maximum output tokens for each semantic_filter judge call. The reply is a single TRUE/FALSE
     # token and judge reasoning is disabled (`semantic_filter_disable_reasoning`), so a tiny cap
     # suffices. If reasoning is re-enabled, raise this too — a reasoning judge that hits the cap
@@ -178,7 +178,7 @@ class SearchAgentConfig(AgentConfig):
     # model while the search agent itself stays on `llm_model` — the filtered-out candidates never
     # enter the agent model's context, so this drives cost down without touching the agent's reasoning.
     semantic_filter_llm_model: str | None = None
-    # OpenRouter provider order (no fallback) for the semantic_filter judge calls only. None => use
+    # OpenRouter provider order (no fallback) for the semantic filter judge calls only. None => use
     # the client-wide `llm_provider_order`. Lets the judge model route to specific providers (e.g.
     # [akashml, parasail]) while the agent model (which may be a different family, e.g. a Google
     # model that those providers don't serve) stays unpinned.
@@ -195,7 +195,8 @@ class SearchAgentConfig(AgentConfig):
     fetch_related_working_sets: bool = False
     # override per-llm call generation caps number for the SearchAgent
     max_output_tokens: int | None = 4096
-    request_timeout_s: float | None = 120.0
+    # maximum number of requests that can go to different chromadb collections in parallel
+    max_parallel_chroma_queries: int = 16
 
 
 # --------------------------------------------------------------------------------

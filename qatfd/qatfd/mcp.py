@@ -22,6 +22,7 @@ from qatfd.benchmarks.base import BenchmarkResources
 SERVER_NAME = "CorpusSearchServer"
 SERVER_INSTRUCTIONS = "This server provides access to a corpus of documents for search, grep, and read operations. Use the provided tools to interact with the corpus."
 SESSION_HEADER = "x-session-id"
+LLM_TIMEOUT_S = 120.0
 
 SEARCH_CORPUS_DESC = """This tool performs a vector search over the corpus by embedding the input `query` and returning the `top_k` most relevant chunks, each labelled with its `chunk_id` and `doc_id`. You can optionally restrict the search to a subset of the corpus by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata.
 
@@ -136,7 +137,7 @@ class _SessionAwareSearchCorpusTool(SearchCorpusTool):
         # get_http_headers() never raises; returns {} outside a request. Keys are lowercased.
         sid = get_http_headers().get(SESSION_HEADER)
         headers = {SESSION_HEADER: sid} if sid else None
-        return self._llm_client.embed_query(query, usage_key=self._usage_key, http_headers=headers)
+        return self._llm_client.embed_query(query, usage_key=self._usage_key, http_headers=headers, timeout_s=LLM_TIMEOUT_S)
 
 
 # TODO: if we decide to experiment with Codex + WS; this will be configured here

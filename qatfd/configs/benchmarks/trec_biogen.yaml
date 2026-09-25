@@ -17,9 +17,9 @@ collection_name: qwen-biogen-0.6b
 splits_path: trec-biogen/trec_biogen_splits.json
 # The 26.8M-abstract corpus is built as 4 per-rank Chroma collections (qwen-biogen-0.6b_r0..r3),
 # because chromadb 1.5.x's metadata-segment compaction fails on a single collection that large.
-# The server(s) must host all 4; the benchmark opens them by name and merges query/get across them
-# (MergedCollection). Set chroma_server_shard_ports to serve each shard from its own port.
-# Set to 1 for a single collection.
+# Each shard is served by its own warm chroma server; the benchmark opens them through a MergedClient
+# and merges query/get across them (MergedCollection). chroma_server_shard_ports (one port per shard)
+# is required whenever this is > 1. Set to 1 for a single collection on chroma_server_port.
 chroma_server_num_shards: 4
 # 40 questions + expert reference answers (the 2024 answers, re-released for the 2025 corpus)
 task_a_path: trec-biogen/2025_task_a.json
@@ -29,6 +29,6 @@ nuggets_path: trec-biogen/baseline_labels.json
 partial_credit: 0.0
 # llm used by the nugget-completion judge
 judge_model: null
-codex_home: trec-biogen/codex/
-codex_scratch_dir: trec-biogen/codex-scratch/
+codex_config_toml: trec-biogen/codex/config.toml
+codex_agents_md: trec-biogen/codex/AGENTS.md
 codex_answer_schema_file: trec-biogen/answer_schema.json

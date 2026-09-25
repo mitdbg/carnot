@@ -57,6 +57,7 @@ from omegaconf import DictConfig, OmegaConf
 from skunk.common import ExecutionContext
 from skunk.config import InferenceConfig, LookupAgentConfig, SkunkConfig, SearchAgentConfig
 from skunk.trace import Tracer
+from skunk.usage import UsageTracker
 
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources
 from qatfd.config import ExperimentConfig, benchmark_config_factory, system_config_factory
@@ -70,13 +71,19 @@ from qatfd.types import Question, Result, report_columns, result_to_row
 # - metrics are returned for a session; token metrics arrive as strings (or ints)
 # - analytics ingestion lags the request by up to ~1 min, so we poll until the row is stable
 OPENROUTER_ANALYTICS_API = "https://openrouter.ai/api/v1/analytics/query"
+_OPENROUTER_SESSION_DIMENSIONS = ["model"]
 _OPENROUTER_SESSION_METRICS = ["request_count", "total_usage", "tokens_prompt", "tokens_completion", "reasoning_tokens", "cached_tokens"]
 OPENROUTER_ANALYTICS_FIRST_WAIT_S = 20.0
 OPENROUTER_ANALYTICS_POLL_S = 10.0
 OPENROUTER_ANALYTICS_MAX_WAIT_S = 120.0
+OPENROUTER_ANALYTICS_WORKERS = 8
 
 # keys to ignore when resuming an experiment from a previous run; these fields may naturally change
-_RESUME_IGNORED_KEYS = {"experiments.resume_dir", "experiments.run_name", "results_root", "dry_run"}
+_RESUME_IGNORED_KEYS = {
+    "experiments.resume_dir", "experiments.run_name", "results_root", "dry_run",
+    # wall-clock cap on the judge request: operational, changes how long a hung call waits, not what is measured
+    "benchmarks.judge_timeout_s",
+}
 
 # modes for running benchmark questions
 class RunMode(Enum):
@@ -89,10 +96,147 @@ class _RunCtx:
     benchmark: Benchmark
     system: System
     resources: BenchmarkResources
-    session_id: str
+    exp_config: ExperimentConfig
     trace_dir: Path
     model: str
     verbose: bool
+
+
+# ---------------------------------------------------------------------------
+# Analytics querying for getting usage on Codex
+# ---------------------------------------------------------------------------
+def _meter_codex_rows(rows: list[Result], tracker: UsageTracker) -> None:
+    """Fill in OpenRouter spend for codex rows after the run: one shared ingestion wait, then one
+    stabilizing poll per row in parallel. Rows with cost already recorded are left alone, so a
+    resumed run only pays the polling cost for its new questions (rows a prior interrupted run
+    never got to meter still read as 0 and are picked up here)."""
+    todo = [r for r in rows if r.cost == 0.0 and r.analytics_id and r.started_at]
+    if not todo:
+        return
+    print(f"[qatfd] metering {len(todo)} codex row(s) via openrouter analytics")
+    time.sleep(OPENROUTER_ANALYTICS_FIRST_WAIT_S)
+
+    def _one(r: Result) -> tuple[Result, dict | None]:
+        started = datetime.datetime.fromisoformat(r.started_at)
+        finished = datetime.datetime.fromisoformat(r.finished_at)
+        return r, _openrouter_session_usage(r.analytics_id, started, finished, first_wait_s=0.0)
+
+    with ThreadPoolExecutor(max_workers=OPENROUTER_ANALYTICS_WORKERS) as pool:
+        for r, ext in pool.map(_one, todo):
+            if ext is None:
+                continue
+            # OpenRouter rounds embedding spend to 6 decimals (a Qwen3 call reads as 0), so re-price
+            # the tokens from our own table when it reports nothing, the way the tracker does
+            embed_cost = float(ext["embed_cost"])
+            if embed_cost == 0.0 and ext["embed_tokens"]:
+                embed_cost = tracker.price_embed(ext["embed_model"], int(ext["embed_tokens"])) or 0.0
+            r.total_input_tokens = ext["input_tokens"]
+            r.total_output_tokens = ext["output_tokens"]
+            r.total_cache_input_tokens = ext["cached_tokens"]
+            r.total_embed_tokens, r.total_embed_calls, r.total_embed_cost = ext["embed_tokens"], ext["embed_calls"], embed_cost
+            r.cost = float(ext["model_cost"]) + embed_cost
+
+
+def _openrouter_session_usage(
+    analytics_id: str,
+    started_at: datetime.datetime,
+    finished_at: datetime.datetime,
+    first_wait_s: float = OPENROUTER_ANALYTICS_FIRST_WAIT_S,
+) -> dict | None:
+    """Per-question spend for one OpenRouter session. Codex forwards the `analtyics_id`
+    on every request via the analytics API. Requires a management key to be set as
+    OPENROUTER_MGMT_API_KEY. The session filter filters `time_range` is mandatory but is only
+    honored at day granularity when no `granularity` is given, so it is widened to whole UTC
+    days around the question. Ingestion lags the request by up to about a minute, so the query
+    is polled until two consecutive reads agree (or a cap is hit) — the last read is returned
+    either way.
+
+    The query is grouped by `model` (one row per model the session touched), and the rows are
+    folded into two groups so the result mirrors `UsageTracker`'s columns: generation models feed
+    the token counts and `model_cost`; embedding models (an "embedding" substring in the model id)
+    feed `embed_tokens` / `embed_calls` / `embed_cost` only. `cost` is model_cost + embed_cost.
+    OpenRouter reports embedding spend rounded to 6 decimals (a Qwen3 call is ~4e-8 USD, so it
+    reads as 0); the caller may re-price `embed_tokens` from the price table when that happens.
+
+    Returns:
+      A dictionary with:
+      {
+        "requests", "input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens",
+        "model_cost", "embed_model", "embed_tokens", "embed_calls", "embed_cost", "cost"
+      }
+      or None if there's a missing key / API error / no rows.
+    """
+    # check to see management key is set
+    mgmt_key = os.environ.get("OPENROUTER_MGMT_API_KEY")
+    if not mgmt_key:
+        print("[qatfd] OPENROUTER_MGMT_API_KEY not set; codex spend not metered", file=sys.stderr)
+        return None
+
+    # prepare query for session data
+    day = datetime.timedelta(days=1)
+    payload = {
+        "dimensions": _OPENROUTER_SESSION_DIMENSIONS,
+        "metrics": _OPENROUTER_SESSION_METRICS,
+        "time_range": {
+            "start": (started_at - day).strftime("%Y-%m-%dT00:00:00Z"),
+            "end": (finished_at + day).strftime("%Y-%m-%dT00:00:00Z"),
+        },
+        "filters": [{"field": "session_id", "operator": "eq", "value": analytics_id}],
+    }
+    headers = {"Authorization": f"Bearer {mgmt_key}", "Content-Type": "application/json"}
+
+    # helper function to fire the query and return the response (or None on bad code / data)
+    def _query() -> dict[str, int | float] | None:
+        resp = requests.post(OPENROUTER_ANALYTICS_API, json=payload, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            print(f"[qatfd] openrouter analytics {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
+            return None
+        rows = resp.json().get("data", {}).get("data", [])
+        if not rows:
+            return None
+
+        # one row per model; token metrics arrive as strings, ints, or None (embedding rows
+        # have no completion tokens). Fold generation rows and embedding rows separately.
+        out = {
+            "requests": 0, "input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0,
+            "cached_tokens": 0, "model_cost": 0.0,
+            "embed_model": None, "embed_tokens": 0, "embed_calls": 0, "embed_cost": 0.0,
+        }
+        for row in rows:
+            model = str(row.get("model") or "")
+            if "embedding" in model.lower():
+                out["embed_model"] = model
+                out["embed_calls"] += int(row.get("request_count") or 0)
+                out["embed_tokens"] += int(row.get("tokens_prompt") or 0)
+                out["embed_cost"] += float(row.get("total_usage") or 0.0)
+            else:
+                out["requests"] += int(row.get("request_count") or 0)
+                out["input_tokens"] += int(row.get("tokens_prompt") or 0)
+                out["output_tokens"] += int(row.get("tokens_completion") or 0)
+                out["reasoning_tokens"] += int(row.get("reasoning_tokens") or 0)
+                out["cached_tokens"] += int(row.get("cached_tokens") or 0)
+                out["model_cost"] += float(row.get("total_usage") or 0.0)
+        out["cost"] = out["model_cost"] + out["embed_cost"]
+        return out
+
+    # return once we have stable response on usage from OpenRouter
+    deadline = time.monotonic() + OPENROUTER_ANALYTICS_MAX_WAIT_S
+    time.sleep(first_wait_s)
+    last: dict[str, int | float] | None = None
+    while True:
+        try:
+            cur = _query()
+        except (requests.RequestException, ValueError) as e:
+            print(f"[qatfd] openrouter analytics request failed: {e}", file=sys.stderr)
+            cur = None
+        if cur is not None and cur == last:
+            return cur
+        last = cur
+        if time.monotonic() >= deadline:
+            if last is None:
+                print(f"[qatfd] openrouter analytics: no rows for session {analytics_id} after {OPENROUTER_ANALYTICS_MAX_WAIT_S:.0f}s", file=sys.stderr)
+            return last
+        time.sleep(OPENROUTER_ANALYTICS_POLL_S)
 
 
 # ---------------------------------------------------------------------------
@@ -134,8 +278,27 @@ def _select_questions(benchmark: Benchmark, config: ExperimentConfig) -> list[Qu
         # sort first so the draw depends only on the seed, not load order; a local RNG
         # (seeded when config.seed is set) keeps the subset reproducible across systems.
         pool = sorted(pool, key=lambda q: q.qid)
-        rng = random.Random(config.seed) if config.seed is not None else random
+        rng = random.Random(config.sample_seed) if config.sample_seed is not None else random
         pool = rng.sample(pool, min(config.sample, len(pool)))
+    if config.shuffle_seed is not None:
+        rng = random.Random(config.shuffle_seed)
+        if config.shuffle_group_key:
+            # keep each group's questions together (and in their original order) and shuffle the groups —
+            # e.g. officeqa_synth's lines of inquiry, whose consecutive related questions are exactly what
+            # the sequential / session-resume scenarios exploit.
+            key = config.shuffle_group_key
+            missing = [q.qid for q in pool if key not in q.meta]
+            if missing:
+                raise Exception(f"[qatfd] ABORT: shuffle_group_key='{key}' missing from meta of {len(missing)} question(s), e.g. {missing[0]}")
+            groups: dict = {}
+            for q in pool:
+                groups.setdefault(q.meta[key], []).append(q)
+            order = list(groups)
+            rng.shuffle(order)
+            pool = [q for g in order for q in groups[g]]
+        else:
+            rng.shuffle(pool)
+
     print(f"[qatfd] split '{config.split}': running {len(pool)} question(s).")
 
     return pool
@@ -145,6 +308,8 @@ def _resolve_run_dir(results_root: str, exp_config: ExperimentConfig, benchmark_
     """
     Resolve the run directory from the given configuration.
     """
+    assert exp_config.run_name is not None
+
     # run directory: resume into an existing one (skip finished questions) or create a fresh
     # timestamped dir. A relative results_root resolves against the cwd; absolute passes through.
     if exp_config.resume_dir:
@@ -154,7 +319,7 @@ def _resolve_run_dir(results_root: str, exp_config: ExperimentConfig, benchmark_
         print(f"[qatfd] resuming run at {run_dir}")
     else:
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_label = f"{exp_config.run_name}_{ts}" if exp_config.run_name else ts
+        run_label = f"{exp_config.run_name}_{ts}"
         run_dir = Path(results_root).expanduser().resolve() / benchmark_name / system_name / run_label
 
     return run_dir
@@ -179,6 +344,12 @@ def _print_summary(rows: list[Result], report_path: Path) -> None:
         vals = [r.recall_metrics.get(k, 0.0) for r in rows]
         print(f"[qatfd] Mean {k}: {sum(vals) / len(vals):.3f} (over {len(vals)} questions)")
     print(f"[qatfd] Total cost: ${cost:.4f}")
+    phases = [("retrieve", sum(r.retrieve_cost for r in rows)), ("compute", sum(r.compute_cost for r in rows)),
+              ("precompute", sum(r.precompute_cost for r in rows)), ("enrich", sum(r.enrich_cost for r in rows))]
+    print("[qatfd] Cost by phase: " + ", ".join(f"{name} ${c:.4f}" for name, c in phases if c > 0 or name in ("retrieve", "compute")))
+    extra_wall = sum(r.precompute_wall_s + r.enrich_wall_s for r in rows)
+    if extra_wall > 0:
+        print(f"[qatfd] Collection-agent wall time: precompute {sum(r.precompute_wall_s for r in rows):.1f}s, enrich {sum(r.enrich_wall_s for r in rows):.1f}s")
 
 
 def _persist_run_config(run_dir: Path, cfg: DictConfig, overrides: list[str] | None) -> None:
@@ -253,82 +424,6 @@ def _load_finished_qids(results_path: Path) -> dict[str, Result]:
 # Per-question execution
 # ---------------------------------------------------------------------------
 
-def _openrouter_session_usage(
-    session_id: str, started_at: datetime.datetime, finished_at: datetime.datetime
-) -> dict[str, int | float] | None:
-    """Per-question spend for one OpenRouter `session_id`. Codex forwards its thread id as the
-    session id on every request via the analytics API. Requires a management key to be set as
-    OPENROUTER_MGMT_API_KEY. The session filter filters `time_range` is mandatory but is only
-    honored at day granularity when no `granularity` is given, so it is widened to whole UTC
-    days around the question. Ingestion lags the request by up to about a minute, so the query
-    is polled until two consecutive reads agree (or a cap is hit) — the last read is returned
-    either way.
-
-    Returns:
-      A dictionary with:
-      {
-        "requests", "input_tokens", "output_tokens",
-        "reasoning_tokens", "cached_tokens", "cost"
-      }
-      or None if there's a missing key / API error / no rows.
-    """
-    # check to see management key is set
-    mgmt_key = os.environ.get("OPENROUTER_MGMT_API_KEY")
-    if not mgmt_key:
-        print("[qatfd] OPENROUTER_MGMT_API_KEY not set; codex spend not metered", file=sys.stderr)
-        return None
-
-    # prepare query for session data
-    day = datetime.timedelta(days=1)
-    payload = {
-        "metrics": _OPENROUTER_SESSION_METRICS,
-        "time_range": {
-            "start": (started_at - day).strftime("%Y-%m-%dT00:00:00Z"),
-            "end": (finished_at + day).strftime("%Y-%m-%dT00:00:00Z"),
-        },
-        "filters": [{"field": "session_id", "operator": "eq", "value": session_id}],
-    }
-    headers = {"Authorization": f"Bearer {mgmt_key}", "Content-Type": "application/json"}
-
-    # helper function to fire the query and return the response (or None on bad code / data)
-    def _query() -> dict[str, int | float] | None:
-        resp = requests.post(OPENROUTER_ANALYTICS_API, json=payload, headers=headers, timeout=30)
-        if resp.status_code != 200:
-            print(f"[qatfd] openrouter analytics {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
-            return None
-        rows = resp.json().get("data", {}).get("data", [])
-        if not rows:
-            return None
-        row = rows[0]
-        return {
-            "requests": int(row.get("request_count") or 0),
-            "input_tokens": int(row.get("tokens_prompt") or 0),
-            "output_tokens": int(row.get("tokens_completion") or 0),
-            "reasoning_tokens": int(row.get("reasoning_tokens") or 0),
-            "cached_tokens": int(row.get("cached_tokens") or 0),
-            "cost": float(row.get("total_usage") or 0.0),
-        }
-
-    # return once we have stable response on usage from OpenRouter
-    deadline = time.monotonic() + OPENROUTER_ANALYTICS_MAX_WAIT_S
-    time.sleep(OPENROUTER_ANALYTICS_FIRST_WAIT_S)
-    last: dict[str, int | float] | None = None
-    while True:
-        try:
-            cur = _query()
-        except (requests.RequestException, ValueError) as e:
-            print(f"[qatfd] openrouter analytics request failed: {e}", file=sys.stderr)
-            cur = None
-        if cur is not None and cur == last:
-            return cur
-        last = cur
-        if time.monotonic() >= deadline:
-            if last is None:
-                print(f"[qatfd] openrouter analytics: no rows for session {session_id} after {OPENROUTER_ANALYTICS_MAX_WAIT_S:.0f}s", file=sys.stderr)
-            return last
-        time.sleep(OPENROUTER_ANALYTICS_POLL_S)
-
-
 async def _run_one(q: Question, rc: _RunCtx) -> Result:
     search_config = (
         rc.system.retrieve_config
@@ -351,19 +446,25 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
         ),
     )
 
+    # set the analytics id; we use a unique analytics_id for each question
+    q_analytics_id = f"{q.qid}-{rc.exp_config.analytics_id}"
+
     # run the question and parse the output
-    q_session_id = f"{q.qid}-{rc.session_id}"
     predicted, failed, reason, retrieved = "", False, "", None
     terminate_state: str | None = None
-    retrieve_wall_s = compute_wall_s = 0.0
+    retrieve_wall_s = compute_wall_s = precompute_wall_s = enrich_wall_s = 0.0
     t0 = time.monotonic()
     started_at = datetime.datetime.now(datetime.timezone.utc)
     try:
-        out = await rc.system.answer(q, rc.resources, ctx, q_session_id)
+        q.text = f"Question: {q.text}"
+        out = await rc.system.answer(q, rc.resources, ctx, q_analytics_id)
+        if out.error:
+            failed, reason = True, out.error
         predicted = out.answer
         retrieved = out.retrieved_doc_ids
         terminate_state = out.terminate_state
         retrieve_wall_s, compute_wall_s = out.retrieve_wall_s, out.compute_wall_s
+        precompute_wall_s, enrich_wall_s = out.precompute_wall_s, out.enrich_wall_s
     except Exception as e:  # noqa: BLE001 — record any failure as a row, never crash the run
         failed, reason = True, f"{type(e).__name__}: {e}"
     wall_s = time.monotonic() - t0
@@ -378,44 +479,31 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
     # `cost` is the all-in total across every caller; the system's own spend is split by phase via
     # its stable per-phase keys ({agent_id}_retrieve / _compute), so we can attribute the retrieval
     # method's cost apart from the shared compute answerer. Without a configured agent_id the
-    # agents mint their own keys and we can't isolate them, so report 0.
+    # agents mint their own keys and we can't isolate them, so report 0. Any further agents the
+    # system ran inside answer() (`extra_usage_keys`, e.g. the precompute / enrich collection agents)
+    # spend on this same client, so they are inside `cost` and broken out under their own columns.
     usage = {
         "total_input_tokens": 0, "total_output_tokens": 0, "total_cache_input_tokens": 0,
-        "cost": 0.0, "retrieve_cost": 0.0, "compute_cost": 0.0,
-        "embed_tokens": 0.0, "embed_calls": 0.0, "embed_cost": 0.0,
+        "total_embed_tokens": 0.0, "total_embed_calls": 0.0, "total_embed_cost": 0.0,
+        "cost": 0.0, "retrieve_cost": 0.0, "compute_cost": 0.0, "precompute_cost": 0.0, "enrich_cost": 0.0,
     }
     if isinstance(rc.system, RetrieveComputeSystem):
         tracker = ctx.llm_client.usage
         retrieve_key, compute_key = rc.system.retrieve_usage_key, rc.system.compute_usage_key
+        extra_keys = rc.system.extra_usage_keys
         usage = {
             "total_input_tokens": tracker.total_input_tokens,
             "total_output_tokens": tracker.total_output_tokens,
             "total_cache_input_tokens": tracker.total_cached_tokens,
+            "total_embed_tokens": tracker.total_embed_tokens,
+            "total_embed_calls": tracker.total_embed_calls,
+            "total_embed_cost": tracker.embed_cost(),
             "cost": tracker.cost(),
             "retrieve_cost": tracker.cost(key=retrieve_key) if retrieve_key else 0.0,
             "compute_cost": tracker.cost(key=compute_key) if compute_key else 0.0,
-            "embed_tokens": tracker.total_embed_tokens,
-            "embed_calls": tracker.total_embed_calls,
-            "embed_cost": tracker.embed_cost(),
+            "precompute_cost": tracker.cost(key=extra_keys["precompute"]) if extra_keys.get("precompute") else 0.0,
+            "enrich_cost": tracker.cost(key=extra_keys["enrich"]) if extra_keys.get("enrich") else 0.0,
         }
-    else:
-        # CodexSystem: the model calls are made by the codex subprocess (and any subagents it spawns)
-        # against OpenRouter directly, so nothing lands in our tracker. Codex forwards its thread id
-        # as OpenRouter's `q_session_id`, and subagent traffic is billed under the parent thread's id,
-        # so one analytics query scoped to that session is this question's exact spend.
-        external_usage = _openrouter_session_usage(q_session_id, started_at, finished_at)
-        if external_usage is not None:
-            usage = {
-                "total_input_tokens": external_usage["input_tokens"],
-                "total_output_tokens": external_usage["output_tokens"],
-                "total_cache_input_tokens": external_usage["cached_tokens"],
-                "cost": external_usage["cost"],
-                "retrieve_cost": 0.0,
-                "compute_cost": 0.0,
-                "embed_tokens": 0.0,
-                "embed_calls": 0.0,
-                "embed_cost": 0.0,
-            }
 
     score, scorer, judge_rationale = 0.0, "", ""
     if not failed:
@@ -435,8 +523,10 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
         predicted=predicted, gold=q.gold, score=score, scorer=scorer,
         recall_metrics=recall_metrics, retrieved_docs=json.dumps(retrieved or []),
         gold_docs=json.dumps(q.gold_docs), failed=failed, reason=reason,
+        analytics_id=q_analytics_id, started_at=started_at.isoformat(), finished_at=finished_at.isoformat(),
         judge_rationale=judge_rationale, wall_s=round(wall_s, 3),
         retrieve_wall_s=round(retrieve_wall_s, 3), compute_wall_s=round(compute_wall_s, 3),
+        precompute_wall_s=round(precompute_wall_s, 3), enrich_wall_s=round(enrich_wall_s, 3),
         out_of_steps=out_of_steps, over_cost_budget=over_cost_budget,
         over_latency_budget=over_latency_budget, **usage,
     )
@@ -466,7 +556,7 @@ def _execute_sequential(rc: _RunCtx, qid_to_result: dict[str, Result], todo: lis
             rf.flush()
             qid_to_result[r.qid] = r
 
-# TODO
+# TODO (?)
 # def _execute_all(rc: _RunCtx, qid_to_result: dict[str, Result], todo: list[Question], results_path: Path, exp_config: ExperimentConfig) -> None:
 #     """Run the benchmark questions in sequence; good for experiments where state is shared / reused across questions."""
 #     results = asyncio.run(_run_all(todo, rc))
@@ -486,13 +576,13 @@ def run(
     system: System,
     exp_config: ExperimentConfig,
     cfg: DictConfig,
+    run_dir: Path,
     overrides: list[str] | None = None,
 ) -> None:
     # force stdout to flush after every newline
     sys.stdout.reconfigure(line_buffering=True)  # type: ignore
 
-    # resolve the directory for storing logs and results for this run
-    run_dir = _resolve_run_dir(cfg.results_root, exp_config, benchmark.name, system.name)
+    # create directory for the traces
     trace_dir = run_dir / "traces"
     trace_dir.mkdir(parents=True, exist_ok=True)
 
@@ -512,7 +602,7 @@ def run(
     qid_to_result = _load_finished_qids(results_path)
     todo = [q for q in questions if q.qid not in qid_to_result]
     for q in todo:
-        for ext in (".jsonl", ".txt"):
+        for ext in (".jsonl", ".codex.jsonl", ".txt"):
             (trace_dir / f"{q.qid}{ext}").unlink(missing_ok=True)
 
     print(f"[qatfd] Trace dir: {trace_dir}")
@@ -525,7 +615,7 @@ def run(
     resources = benchmark.get_resources()
     model = system.inference_cfg.llm_model
     rc = _RunCtx(
-        benchmark=benchmark, system=system, resources=resources, session_id=exp_config.session_id,
+        benchmark=benchmark, system=system, resources=resources, exp_config=exp_config,
         trace_dir=trace_dir, model=model, verbose=exp_config.console,
     )
 
@@ -534,19 +624,33 @@ def run(
         mcp = build_mcp_server(resources, system.inference_cfg)
         start_mcp_server(mcp, system.codex_config.mcp_url)
 
+    # TODO: only introduce this if necessary
+    # # if we're doing DCI, copy the raw data files to the working directory
+    # if isinstance(system, CodexSystem) and system.codex_config.corpus_interaction in ["dci", "both"]:
+    #     work_dir = resolve_under_benchmarks(system.codex_scratch_dir)
+
     # execute each question and immediately persist its result to results.jsonl
     if RunMode(exp_config.run_mode) == RunMode.PARALLEL:
         _execute_parallel(rc, qid_to_result, todo, results_path, exp_config)
     elif RunMode(exp_config.run_mode) == RunMode.SEQUENTIAL:
         _execute_sequential(rc, qid_to_result, todo, results_path, exp_config)
-    # TODO
-    # elif RunMode(exp_config.run_mode) == RunMode.ALL:
-    #     _execute_all(rc, qid_to_result, todo, results_path, exp_config)
     else:
         raise Exception(f"Unsupported run_mode: {exp_config.run_mode}")
 
     # write report.csv from the full completed set, in the original selection order
     rows = [qid_to_result[q.qid] for q in questions if q.qid in qid_to_result]
+
+    # codex rows were streamed to results.jsonl with zero usage; meter them now and rewrite the file
+    if isinstance(system, CodexSystem):
+        _meter_codex_rows(rows, UsageTracker(default_model=system.inference_cfg.llm_model, prices=system.inference_cfg.llm_prices))
+        tmp = results_path.with_suffix(".jsonl.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(asdict(r)) + "\n")
+
+        # atomic: a kill mid-rewrite leaves the streamed file intact
+        tmp.replace(results_path)
+
     report_path = run_dir / "report.csv"
     with report_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=report_columns(rows))
@@ -569,16 +673,28 @@ def main(cfg: DictConfig) -> None:
 
     print(f"[qatfd] composed config:\n{OmegaConf.to_yaml(cfg)}")
 
-    # the CLI overrides that produced this composed config (snapshotted alongside it).
+    # the CLI overrides that produced this composed config (snapshotted alongside it)
     try:
         overrides = list(HydraConfig.get().overrides.task)
     except Exception:  # noqa: BLE001 — HydraConfig is unset outside a @hydra.main job
         overrides = []
 
+    # construct the configs
     exp_cfg = ExperimentConfig(**cast(dict, OmegaConf.to_container(cfg.experiments, resolve=True)))
     inference_cfg = InferenceConfig(**cast(dict, OmegaConf.to_container(cfg.inference, resolve=True)))
     bench_cfg = benchmark_config_factory(cfg)
     retrieve_system_cfg, compute_system_cfg, codex_system_cfg = system_config_factory(cfg)
+
+    # resolve system name based on config
+    system_name = None
+    if codex_system_cfg:
+        system_name = codex_system_cfg.name
+    elif retrieve_system_cfg:
+        system_name = retrieve_system_cfg.name
+    assert system_name is not None
+
+    # resolve the directory for storing logs and results for this run
+    run_dir = _resolve_run_dir(cfg.results_root, exp_cfg, bench_cfg.name, system_name)
 
     # build benchmark and system
     benchmark = build_benchmark(bench_cfg)
@@ -587,10 +703,11 @@ def main(cfg: DictConfig) -> None:
         retrieve_config=retrieve_system_cfg,
         compute_config=compute_system_cfg,
         codex_config=codex_system_cfg,
+        run_dir=run_dir,
     )
 
     if not cfg.dry_run:
-        run(benchmark, system, exp_cfg, cfg, overrides=overrides)
+        run(benchmark, system, exp_cfg, cfg, run_dir, overrides=overrides)
 
 
 if __name__ == "__main__":

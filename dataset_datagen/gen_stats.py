@@ -8,24 +8,22 @@ distinct `agent_id`, a single shared `LLMClient` still yields exact per-agent to
 counts and cost. That is what `usage_snapshot` reads out.
 
 Latency is NOT tracked by the usage tracker. Per-call latency only shows up as
-`latency_s=` on the `call ...` events of the `ExecutionContext` event stream, and those
-events carry no usage key. Since the agents within one question run sequentially,
-`events_latency` recovers per-agent LLM latency by slicing that question's event list
-around the agent call; wall-clock is measured directly by the caller.
+`data["latency_s"]` on the `kind="call"` events the `Tracer` streams to its per-question
+`.jsonl` file, and those events carry no usage key. Since the agents within one question
+run sequentially, `trace_latency` recovers per-agent LLM latency by reading the slice of
+that file the agent appended (byte offset before vs. after the call); wall-clock is
+measured directly by the caller.
 """
 
 from __future__ import annotations
 
-import re
+import json
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from skunk.llm_client import LLMClient
-
-# `latency_s=1.234` on the uniform `call ...` envelope emitted by `LLMClient._build_response`
-# (generation) and `LLMClient.embed_query` (embeddings).
-_LATENCY_RE = re.compile(r"\blatency_s=([0-9.]+)")
 
 
 @dataclass
@@ -121,21 +119,34 @@ def usage_snapshot(
     return stats
 
 
-def events_latency(events: list[dict], start: int) -> float:
-    """Summed `latency_s` of the `call ...` events in `events[start:]`.
+def trace_latency(log_path: Path | str, start_offset: int) -> float:
+    """Summed `data["latency_s"]` of the `kind="call"` events written to the tracer's
+    `.jsonl` file from byte `start_offset` onward.
 
-    `start` is the length of the event list captured immediately before the agent ran.
-    Only valid when a single agent was running over that slice — true here because the
-    line-of-inquiry and follow-up agents within one question run one after another.
+    `start_offset` is the file size captured immediately before the agent ran (the
+    `Tracer` flushes after every event, so the size is exact). Only valid when a single
+    agent was running over that slice — true here because the agents within one question
+    run one after another on one `ExecutionContext` / `Tracer`. The uniform `call`
+    envelope is emitted by `LLMClient._build_response` (generation) and
+    `LLMClient.embed_query` (embeddings); retry warnings share the `call` kind but carry
+    no `latency_s`, so they are skipped.
     """
     total = 0.0
-    for evt in events[start:]:
-        message = evt.get("message", "")
-        if not message.startswith("call "):
-            continue
-        m = _LATENCY_RE.search(message)
-        if m:
-            total += float(m.group(1))
+    with open(log_path, "r", encoding="utf-8") as f:
+        f.seek(start_offset)
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:  # tolerate a partial trailing line
+                continue
+            if evt.get("kind") != "call":
+                continue
+            latency = (evt.get("data") or {}).get("latency_s")
+            if latency is not None:
+                total += float(latency)
     return total
 
 

@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -16,20 +17,21 @@ from chromadb.api.models.Collection import Collection
 from jinja2 import Environment, StrictUndefined
 from skunk.chroma_client import make_chroma_client
 from skunk.common import ExecutionContext
-from skunk.config import InferenceConfig, LookupAgentConfig, OrchestratorConfig, SearchAgentConfig, StorageConfig
+from skunk.config import InferenceConfig, LookupAgentConfig, SearchAgentConfig, SkunkConfig, StorageConfig
 from skunk.llm_client import LLMClient
-from skunk.multi_turn_agent import MultiTurnAgent, Tool
-from skunk.search_agent.retrieval_state import RetrievalState
-from skunk.search_agent.search_tools import (
+from skunk.agents.multi_turn_agent import MultiTurnAgent, parse_step
+from skunk.search_state.working_set import WorkingSet
+from skunk.agents.search_agent.search_tools import (
     GrepCorpusTool,
     ReadDocumentTool,
     SearchCorpusTool,
     ViewFigureTool,
 )
 from skunk.storage.document_map import DocumentMap
+from skunk.trace import Tracer
 from skunk.usage import UsageTracker
 
-from dataset_datagen.gen_stats import GenStats, aggregate, events_latency, usage_snapshot
+from dataset_datagen.gen_stats import GenStats, aggregate, trace_latency, usage_snapshot
 
 _ENV = Environment(
     autoescape=False, keep_trailing_newline=True, undefined=StrictUndefined
@@ -88,26 +90,33 @@ DATAGEN_PROMPT_FILE = pathlib.Path(__file__).parent / "prompts.yaml"
 with DATAGEN_PROMPT_FILE.open() as _f:
     _DATAGEN_PROMPTS = yaml.safe_load(_f)
 
+TERMINAL_PROMPT: str = _DATAGEN_PROMPTS["terminal_prompt"]
 DATAGEN_LINE_OF_INQUIRY_SYSTEM_PROMPT: str = _DATAGEN_PROMPTS["datagen_line_of_inquiry_system_prompt"]
 DATAGEN_LINE_OF_INQUIRY_USER_PROMPT: str = _DATAGEN_PROMPTS["datagen_line_of_inquiry_user_prompt"]
+DATAGEN_LINE_OF_INQUIRY_FEEDBACK_PROMPT: str = _DATAGEN_PROMPTS["datagen_line_of_inquiry_feedback_prompt"]
 DATAGEN_FOLLOW_UP_QUESTION_SYSTEM_PROMPT: str = _DATAGEN_PROMPTS["datagen_follow_up_question_system_prompt"]
 DATAGEN_FOLLOW_UP_QUESTION_USER_PROMPT: str = _DATAGEN_PROMPTS["datagen_follow_up_question_user_prompt"]
+DATAGEN_FOLLOW_UP_QUESTION_FEEDBACK_PROMPT: str = _DATAGEN_PROMPTS["datagen_follow_up_question_feedback_prompt"]
 DATAGEN_SOLVER_SYSTEM_PROMPT: str = _DATAGEN_PROMPTS["datagen_solver_system_prompt"]
 DATAGEN_SOLVER_USER_PROMPT: str = _DATAGEN_PROMPTS["datagen_solver_user_prompt"]
 DATAGEN_EQUIVALENCE_SYSTEM_PROMPT: str = _DATAGEN_PROMPTS["datagen_answer_equivalence_system_prompt"]
 DATAGEN_EQUIVALENCE_USER_PROMPT: str = _DATAGEN_PROMPTS["datagen_answer_equivalence_user_prompt"]
 DATAGEN_OFFICEQA_SPECIAL_NOTES: str = _DATAGEN_PROMPTS["datagen_officeqa_special_notes"]
-OFFICEQA_DATAGEN_GUIDANCE: str = _DATAGEN_PROMPTS["officeqa_datagen_guidance"]
+# OFFICEQA_DATAGEN_GUIDANCE: str = _DATAGEN_PROMPTS["officeqa_datagen_guidance"]
 
 DEDUP_LINE_OF_INQUIRY_JUDGE_PROMPT = _DATAGEN_PROMPTS["dedup_line_of_inquiry_judge_prompt"]
 DEDUP_QA_PAIR_JUDGE_PROMPT = _DATAGEN_PROMPTS["dedup_qa_pair_judge_prompt"]
 
-# per-benchmark statistics for the number of relevant chunks per question.
-# Values are (mean, std) drawn from Table 2 of the KARL paper.
-# Used to sample a target chunk count from N(mean, std) for each generation.
+# per-benchmark statistics for the number of relevant chunks and nuggets per question.
+# Values are (mean, std) drawn from Table 2 of the KARL paper (or precomputed for OfficeQA).
+# Used to sample a target chunk / nugget count from N(mean, std) for each generation.
 BENCHMARK_CHUNKS_STATS: dict[str, tuple[float, float]] = {
     "officeqa":        (1.8,  1.1),
     "browsecomp-plus": (2.9,  2.0),
+}
+BENCHMARK_NUGGETS_STATS: dict[str, tuple[float, float]] = {
+    "officeqa":        (1.2,  1.0),
+    "browsecomp-plus": (1.0,  0.0),
 }
 
 # imports the datagen agent is allowed to use inside its python tool blocks,
@@ -239,8 +248,8 @@ def _create_docs_str(document_map: DocumentMap, doc_ids: list[str]) -> str:
         docs_str += f"\n\n=== Document ID: {doc_id} ===\n{page_text}"
     return docs_str
 
-async def _is_inquiry_unique(inquiry: str, question: dict, ctx: ExecutionContext, attempt: int, stats: list[GenStats], collection: Collection, lock: threading.Lock) -> bool:
-    """Check if the inquiry is unique in the given ChromaDB collection.
+async def _is_inquiry_unique(inquiry: str, question: dict, ctx: ExecutionContext, attempt: int, stats: list[GenStats], collection: Collection, lock: threading.Lock) -> tuple[bool, dict]:
+    """Check if the inquiry is unique in the given ChromaDB collection. Returns feedback for non-unique lines of inquiry.
 
     Uses a lock to ensure thread-safe access to the collection.
     """
@@ -265,7 +274,7 @@ async def _is_inquiry_unique(inquiry: str, question: dict, ctx: ExecutionContext
         ]
 
         # for the first line of inquiry, skip duplicate judgement
-        duplicate = False
+        unique, duplicate_feedback = True, {}
         if len(inquiries) > 0:
             # step 2: judge inquiry vs. closest neighbors
             system_prompt = _ENV.from_string(DEDUP_LINE_OF_INQUIRY_JUDGE_PROMPT).render(
@@ -274,19 +283,31 @@ async def _is_inquiry_unique(inquiry: str, question: dict, ctx: ExecutionContext
                 seed_answer=question["answer"],
                 lines_of_inquiry=neighbor_lines_of_inquiry,
             )
+            dup_agent_config = deepcopy(ctx.config.search)
+            dup_agent_config.max_steps = 1
+            dup_agent_config.max_misfires = 3
+            dup_agent_config.agent_id = duplicate_agent_id
             duplicate_agent = DuplicateAgent(
+                dup_agent_config,
                 tools=[],
-                max_steps=1,
-                max_misfires=3,
-                agent_id=duplicate_agent_id,
-                system_prompt_override=system_prompt,
+                system_prompt=system_prompt,
+                terminal_prompt=TERMINAL_PROMPT,
+                parse=parse_step,
             )
             out, dedup_stats = await _run_agent(
                 duplicate_agent, ctx, "output:\n", stats, kind="line_of_inquiry_dedup", qid=str(question["qid"]), attempt=attempt,
             )
-            duplicate = out["duplicate"] is True
-            dedup_stats.unique = not duplicate
-            dedup_stats.error = out["reasoning"] if duplicate else None
+            duplicate = out["duplicate"]
+            unique = duplicate is None
+            if not unique:
+                dup_inquiry = list(filter(lambda inq: str(inq["id"]) == str(out["duplicate"]), neighbor_lines_of_inquiry))[0]
+                duplicate_feedback = {
+                    "prev_line_of_inquiry": inquiry,
+                    "duplicate_line_of_inquiry": dup_inquiry["line_of_inquiry"],
+                    "duplicate_reason": out["reasoning"],
+                }
+            dedup_stats.unique = unique
+            dedup_stats.error = None if unique else out["reasoning"]
         else:
             # no judge ran, but the embedding above still cost money — snapshot its bucket
             embed_stats = usage_snapshot(
@@ -296,7 +317,7 @@ async def _is_inquiry_unique(inquiry: str, question: dict, ctx: ExecutionContext
             stats.append(embed_stats)
 
         # step 3: insert inquiry into database (if it survives judging)
-        if not duplicate:
+        if unique:
             collection.add(
                 ids=[str(question["qid"])],
                 embeddings=[embedding],
@@ -304,68 +325,83 @@ async def _is_inquiry_unique(inquiry: str, question: dict, ctx: ExecutionContext
                 metadatas=[{"question": question["question"], "answer": question["answer"]}],
             )
 
-        return not duplicate
+        return unique, duplicate_feedback
 
-async def _is_qa_pair_unique(qa_pair: dict, qid: str, idx: int, solvable: bool, attempt: int, stats: list[GenStats], ctx: ExecutionContext, collection: Collection, lock: threading.Lock) -> bool:
-    """Check if the qa_pair is unique in the given ChromaDB collection.
+async def _is_qa_pair_unique(qa_pair: dict, qid: str, idx: int, solvable: bool, attempt: int, stats: list[GenStats], ctx: ExecutionContext, collection: Collection, lock: threading.Lock) -> tuple[bool, dict]:
+    """Check if the qa_pair is unique in the given ChromaDB collection. Returns feedback for non-unique qa pairs.
 
     Uses a lock to ensure thread-safe access to the collection.
     """
     # skip LLM check if qa pair is not solvable
     if not solvable:
-        return False
+        return False, {}
 
     synth_qa_pair_id = f"{qid}_{idx}"
     with lock:
-            # step 1: query closest neighbors by question
-            duplicate_agent_id = f"duplicate_agent_{synth_qa_pair_id}_try{attempt}"
-            embedding = ctx.llm_client.embed_query(qa_pair["question"], usage_key=duplicate_agent_id)
-            results = collection.query(
-                query_embeddings=[embedding],
-                n_results=TOP_K_NEIGHBORS,
-                where={"kind": "question"},
-                include=["metadatas", "documents"],
+        # step 1: query closest neighbors by question
+        duplicate_agent_id = f"duplicate_agent_{synth_qa_pair_id}_try{attempt}"
+        embedding = ctx.llm_client.embed_query(qa_pair["question"], usage_key=duplicate_agent_id)
+        results = collection.query(
+            query_embeddings=[embedding],
+            n_results=TOP_K_NEIGHBORS,
+            where={"kind": "question"},
+            include=["metadatas", "documents"],
+        )
+        documents, metadatas = results['documents'], results['metadatas']
+        assert documents is not None and metadatas is not None
+        ids = results['ids'][0]
+        questions = documents[0]
+        answers = [m['answer'] for m in metadatas[0]]
+        neighbor_qa_pairs = [
+            {"qid": _id, "question": question, "answer": answer}
+            for _id, question, answer in zip(ids, questions, answers, strict=True)
+        ]
+
+        # step 2: judge qa-pair vs. closest neighbors
+        system_prompt = _ENV.from_string(DEDUP_QA_PAIR_JUDGE_PROMPT).render(
+            generated_question=qa_pair["question"],
+            generated_answer=qa_pair["answer"],
+            qa_pairs=neighbor_qa_pairs,
+        )
+        dup_agent_config = deepcopy(ctx.config.search)
+        dup_agent_config.max_steps = 1
+        dup_agent_config.max_misfires = 3
+        dup_agent_config.agent_id = duplicate_agent_id
+        duplicate_agent = DuplicateAgent(
+            dup_agent_config,
+            tools=[],
+            system_prompt=system_prompt,
+            terminal_prompt=TERMINAL_PROMPT,
+            parse=parse_step,
+        )
+        out, dedup_stats = await _run_agent(
+            duplicate_agent, ctx, "output:\n", stats, kind="qa_pair_dedup", qid=synth_qa_pair_id, attempt=attempt,
+        )
+        duplicate = out["duplicate"]
+        unique = duplicate is None
+        duplicate_feedback = {}
+        if not unique:
+            dup_qa_pair = list(filter(lambda pair: str(pair["qid"]) == str(out["duplicate"]), neighbor_qa_pairs))[0]
+            duplicate_feedback = {
+                "prev_qa_pair_question": qa_pair["question"],
+                "prev_qa_pair_answer": qa_pair["answer"],
+                "duplicate_question": dup_qa_pair["question"],
+                "duplicate_answer": dup_qa_pair["answer"],
+                "duplicate_reason": out["reasoning"],
+            }
+        dedup_stats.unique = unique
+        dedup_stats.error = None if unique else out["reasoning"]
+
+        # step 3: insert qa-pair into database (if it survives judging)
+        if unique:
+            collection.add(
+                ids=[synth_qa_pair_id],
+                embeddings=[embedding],
+                documents=[qa_pair["question"]],
+                metadatas=[{"qa_id": synth_qa_pair_id, "kind": "question", "is_synthetic": True, "answer": qa_pair["answer"]}],
             )
-            documents, metadatas = results['documents'], results['metadatas']
-            assert documents is not None and metadatas is not None
-            ids = results['ids'][0]
-            questions = documents[0]
-            answers = [m['answer'] for m in metadatas[0]]
-            neighbor_qa_pairs = [
-                {"qid": _id, "question": question, "answer": answer}
-                for _id, question, answer in zip(ids, questions, answers, strict=True)
-            ]
-    
-            # step 2: judge qa-pair vs. closest neighbors
-            system_prompt = _ENV.from_string(DEDUP_QA_PAIR_JUDGE_PROMPT).render(
-                generated_question=qa_pair["question"],
-                generated_answer=qa_pair["answer"],
-                qa_pairs=neighbor_qa_pairs,
-            )
-            duplicate_agent = DuplicateAgent(
-                tools=[],
-                max_steps=1,
-                max_misfires=3,
-                agent_id=duplicate_agent_id,
-                system_prompt_override=system_prompt,
-            )
-            out, dedup_stats = await _run_agent(
-                duplicate_agent, ctx, "output:\n", stats, kind="qa_pair_dedup", qid=synth_qa_pair_id, attempt=attempt,
-            )
-            duplicate = out["duplicate"] is True
-            dedup_stats.unique = not duplicate
-            dedup_stats.error = out["reasoning"] if duplicate else None
-    
-            # step 3: insert qa-pair into database (if it survives judging)
-            if not duplicate:
-                collection.add(
-                    ids=[synth_qa_pair_id],
-                    embeddings=[embedding],
-                    documents=[qa_pair["question"]],
-                    metadatas=[{"qa_id": synth_qa_pair_id, "kind": "question", "is_synthetic": True, "answer": qa_pair["answer"]}],
-                )
-    
-            return not duplicate
+
+        return unique, duplicate_feedback
 
 async def _is_solvable(qa_pair: dict, qid: str, idx: int, attempt: int, solver_llm_client: LLMClient, stats: list[GenStats], ctx: ExecutionContext, document_map: DocumentMap) -> bool:
     """Check whether an agent given the question and the groundtruth documents can solve the question.
@@ -380,15 +416,17 @@ async def _is_solvable(qa_pair: dict, qid: str, idx: int, attempt: int, solver_l
         # create solver agent
         solver_agent_id = f"solver_agent_{qid}_{idx}_try{attempt}"
         system_prompt = _ENV.from_string(DATAGEN_SOLVER_SYSTEM_PROMPT).render(
-            max_steps=ctx.config.search.agent_max_steps,
+            max_steps=ctx.config.search.max_steps,
             special_notes=DATAGEN_OFFICEQA_SPECIAL_NOTES,
         )
+        solver_agent_config = deepcopy(ctx.config.search)
+        solver_agent_config.agent_id = solver_agent_id
         solver_agent = SolverAgent(
+            solver_agent_config,
             tools=[],
-            max_steps=ctx.config.search.agent_max_steps,
-            max_misfires=ctx.config.search.agent_max_misfires,
-            agent_id=solver_agent_id,
-            system_prompt_override=system_prompt,
+            system_prompt=system_prompt,
+            terminal_prompt=TERMINAL_PROMPT,
+            parse=parse_step,
         )
 
         # run agent to generate solution
@@ -412,12 +450,14 @@ async def _is_solvable(qa_pair: dict, qid: str, idx: int, attempt: int, solver_l
 
         # return True if the answers are semantically equiavlent
         equivalence_agent_id = f"equivalence_agent_{qid}_{idx}_try{attempt}"
+        equivalence_agent_config = deepcopy(ctx.config.search)
+        equivalence_agent_config.agent_id = equivalence_agent_id
         equivalence_agent = EquivalenceAgent(
+            equivalence_agent_config,
             tools=[],
-            max_steps=ctx.config.search.agent_max_steps,
-            max_misfires=ctx.config.search.agent_max_misfires,
-            agent_id=equivalence_agent_id,
-            system_prompt_override=DATAGEN_EQUIVALENCE_SYSTEM_PROMPT,
+            system_prompt=DATAGEN_EQUIVALENCE_SYSTEM_PROMPT,
+            terminal_prompt=TERMINAL_PROMPT,
+            parse=parse_step,
         )
         input_str = _ENV.from_string(DATAGEN_EQUIVALENCE_USER_PROMPT).render(
             question=qa_pair["question"],
@@ -453,13 +493,14 @@ async def _run_agent(
 
     Cost comes from the agent's own `UsageTracker` bucket (keyed by its `agent_id`), so it
     is exact even though every agent in the question shares one `LLMClient`. LLM latency is
-    recovered from the slice of this question's event stream the agent produced — valid
-    because the agents within one question run sequentially on one `ExecutionContext`.
+    recovered from the slice of this question's trace file (`ctx.tracer.log_path`) the agent
+    appended — valid because the agents within one question run sequentially on one
+    `ExecutionContext` / `Tracer`.
 
     The row is appended to `stats_list` before returning, so it survives even if the
     caller then fails on an empty payload.
     """
-    events_start = len(ctx.events)
+    trace_start = ctx.tracer.log_path.stat().st_size
     t0 = time.monotonic()
     try:
         out: dict = await agent.call(ctx, input_str)
@@ -467,7 +508,14 @@ async def _run_agent(
     except Exception as e:  # keep one failed generation from killing the whole question
         out = {}
         error = f"{type(e).__name__}: {e}"
-        ctx.emit(f"generation_failed kind={kind} agent_id={agent.agent_id} error={error!r}")
+        ctx.tracer.emit(
+            id="generation_failed",
+            level="error",
+            kind="error",
+            step=agent.step,
+            message=f"generation_failed kind={kind} agent_id={agent.agent_id} error={error!r}",
+            data={"kind": kind, "agent_id": str(agent.agent_id), "error": error},
+        )
     stats = usage_snapshot(
         ctx.llm_client,
         str(agent.agent_id),
@@ -476,7 +524,7 @@ async def _run_agent(
         idx=idx,
         attempt=attempt,
         wall_latency_s=time.monotonic() - t0,
-        llm_latency_s=events_latency(ctx.events, events_start),
+        llm_latency_s=trace_latency(ctx.tracer.log_path, trace_start),
         n_steps=agent.step,
     )
     stats.terminate_state = "error" if error else agent.terminate_state
@@ -485,31 +533,33 @@ async def _run_agent(
     return out, stats
 
 async def _generate_line_of_inquiry(
-    question: dict, ctx: ExecutionContext, attempt: int, stats: list[GenStats], collection: Collection, document_map: DocumentMap
+    question: dict, duplicate_feedback: dict, ctx: ExecutionContext, attempt: int, stats: list[GenStats], collection: Collection, document_map: DocumentMap
 ) -> dict:
     # instantiate inquiry agent. `agent_id` doubles as the UsageTracker bucket key for both
     # the agent's own LLM steps and its tools' embedding calls, so it must be unique.
     inquiry_agent_id = f"inquiry_agent_{question['qid']}_try{attempt}"
-    state = RetrievalState()
-    tools: list[Tool] = [
-        SearchCorpusTool(collection, ctx.llm_client, state, ctx, usage_key=inquiry_agent_id),
-        GrepCorpusTool(collection, state),
-        ReadDocumentTool(document_map, state),
+    ws = WorkingSet(collection=collection)
+    tools = [
+        SearchCorpusTool(collection, ctx.llm_client, ws, usage_key=inquiry_agent_id, working_set_collection_off=True, id_tracking_off=True),
+        GrepCorpusTool(collection, ws, working_set_collection_off=True, id_tracking_off=True),
+        ReadDocumentTool(document_map, ws, id_tracking_off=True),
     ]
     if ctx.config.storage.pdf_dir:
         tools.append(ViewFigureTool(document_map, ctx.config.storage.pdf_dir))
     tools_prompt_str = "\n\n".join(t.doc for t in tools)
     system_prompt = _ENV.from_string(DATAGEN_LINE_OF_INQUIRY_SYSTEM_PROMPT).render(
         tools_prompt_str=tools_prompt_str,
-        max_steps=ctx.config.search.agent_max_steps,
+        max_steps=ctx.config.search.max_steps,
         special_notes=DATAGEN_OFFICEQA_SPECIAL_NOTES,
     )
+    inquiry_agent_config = deepcopy(ctx.config.search)
+    inquiry_agent_config.agent_id = inquiry_agent_id
     inquiry_agent = InquirySynthAgent(
+        inquiry_agent_config,
         tools=tools,
-        max_steps=ctx.config.search.agent_max_steps,
-        max_misfires=ctx.config.search.agent_max_misfires,
-        agent_id=inquiry_agent_id,
-        system_prompt_override=system_prompt,
+        system_prompt=system_prompt,
+        terminal_prompt=TERMINAL_PROMPT,
+        parse=parse_step,
     )
     supporting_docs = _create_docs_str(document_map, question["page_ids"])
     input_str = _ENV.from_string(DATAGEN_LINE_OF_INQUIRY_USER_PROMPT).render(
@@ -517,35 +567,46 @@ async def _generate_line_of_inquiry(
         answer=question["answer"],
         supporting_docs=supporting_docs,
     )
+    if duplicate_feedback:
+        feedback_str = _ENV.from_string(DATAGEN_LINE_OF_INQUIRY_FEEDBACK_PROMPT).render(
+            prev_line_of_inquiry=duplicate_feedback["prev_line_of_inquiry"],
+            duplicate_line_of_inquiry=duplicate_feedback["duplicate_line_of_inquiry"],
+            duplicate_reason=duplicate_feedback["duplicate_reason"],
+        )
+        input_str = f"{feedback_str}\n\n{input_str}"
     out, _ = await _run_agent(
         inquiry_agent, ctx, input_str, stats, kind="line_of_inquiry", qid=str(question["qid"]), attempt=attempt
     )
     return out
 
-async def _generate_follow_up_question(idx: int, n_docs: int, question: dict, qa_pairs: list[dict], line_of_inquiry: dict, attempt: int, stats: list[GenStats], ctx: ExecutionContext, collection: Collection, document_map: DocumentMap) -> dict:
+async def _generate_follow_up_question(idx: int, n_docs: int, n_nuggets: int, question: dict, qa_pairs: list[dict], line_of_inquiry: dict, example_qa_pairs: list[dict], duplicate_feedback: dict, attempt: int, stats: list[GenStats], ctx: ExecutionContext, collection: Collection, document_map: DocumentMap) -> dict:
     # instantiate follow-up question agent
     follow_up_agent_id = f"follow_up_agent_{question['qid']}_{idx}_try{attempt}"
-    state = RetrievalState()
-    tools: list[Tool] = [
-        SearchCorpusTool(collection, ctx.llm_client, state, ctx, usage_key=follow_up_agent_id),
-        GrepCorpusTool(collection, state),
-        ReadDocumentTool(document_map, state),
+    ws = WorkingSet(collection=collection)
+    tools = [
+        SearchCorpusTool(collection, ctx.llm_client, ws, usage_key=follow_up_agent_id, working_set_collection_off=True, id_tracking_off=True),
+        GrepCorpusTool(collection, ws, working_set_collection_off=True, id_tracking_off=True),
+        ReadDocumentTool(document_map, ws, id_tracking_off=True),
     ]
     if ctx.config.storage.pdf_dir:
         tools.append(ViewFigureTool(document_map, ctx.config.storage.pdf_dir))
     tools_prompt_str = "\n\n".join(t.doc for t in tools)
     system_prompt = _ENV.from_string(DATAGEN_FOLLOW_UP_QUESTION_SYSTEM_PROMPT).render(
         n_docs=n_docs,
+        n_nuggets=n_nuggets,
         tools_prompt_str=tools_prompt_str,
-        max_steps=ctx.config.search.agent_max_steps,
+        max_steps=ctx.config.search.max_steps,
         special_notes=DATAGEN_OFFICEQA_SPECIAL_NOTES,
+        example_qa_pairs=example_qa_pairs,
     )
+    follow_up_agent_config = deepcopy(ctx.config.search)
+    follow_up_agent_config.agent_id = follow_up_agent_id
     follow_up_question_agent = FollowUpQuestionSynthAgent(
+        follow_up_agent_config,
         tools=tools,
-        max_steps=ctx.config.search.agent_max_steps,
-        max_misfires=ctx.config.search.agent_max_misfires,
-        agent_id=follow_up_agent_id,
-        system_prompt_override=system_prompt,
+        system_prompt=system_prompt,
+        terminal_prompt=TERMINAL_PROMPT,
+        parse=parse_step,
     )
     line_of_inquiry_str = line_of_inquiry["line_of_inquiry"]
     relevant_docs = _create_docs_str(document_map, line_of_inquiry["doc_ids"]) + "\n\n"
@@ -554,6 +615,15 @@ async def _generate_follow_up_question(idx: int, n_docs: int, question: dict, qa
         relevant_docs=relevant_docs,
         qa_pairs=[{"question": q["question"], "answer": q["answer"], "supporting_docs": _create_docs_str(document_map, q["doc_ids"])} for q in qa_pairs],
     )
+    if duplicate_feedback:
+        feedback_str = _ENV.from_string(DATAGEN_FOLLOW_UP_QUESTION_FEEDBACK_PROMPT).render(
+            prev_qa_pair_question=duplicate_feedback["prev_qa_pair_question"],
+            prev_qa_pair_answer=duplicate_feedback["prev_qa_pair_answer"],
+            duplicate_question=duplicate_feedback["duplicate_question"],
+            duplicate_answer=duplicate_feedback["duplicate_answer"],
+            duplicate_reason=duplicate_feedback["duplicate_reason"],
+        )
+        input_str = f"{feedback_str}\n\n{input_str}"
     out, _ = await _run_agent(
         follow_up_question_agent, ctx, input_str, stats,
         kind="follow_up_question", qid=str(question["qid"]), idx=idx, attempt=attempt,
@@ -564,7 +634,11 @@ async def generate_follow_up_questions(
     k: int,
     docs_mean: float,
     docs_std: float,
+    nuggets_mean: float,
+    nuggets_std: float,
     question: dict,
+    example_pool: list[dict],
+    n_example_qa_pairs: int,
     stats: list[GenStats],
     ctx: ExecutionContext,
     solver_llm_client: LLMClient,
@@ -572,25 +646,44 @@ async def generate_follow_up_questions(
     document_map: DocumentMap,
     inquiry_collection: Collection,
     qa_collection: Collection,
-) -> tuple[list[dict], list[GenStats]]:
+) -> tuple[list[dict], list[GenStats], list[str]]:
     """Generate `k` follow-up QA pairs for one seed question, with their per-generation stats.
 
     The returned `qa_pairs` lead with the seed question (index 0) so each follow-up sees the
     full chain; `stats` carries one `GenStats` per agent run (the line of inquiry, then one
-    per follow-up), in generation order.
+    per follow-up), in generation order. The third element lists the qids of the
+    `n_example_qa_pairs` benchmark questions sampled from `example_pool` (excluding this seed)
+    and shown to every follow-up agent as style/difficulty exemplars.
     """
     rng = np.random.default_rng(seed=int.from_bytes(str(question["qid"]).encode(), "big"))
 
+    # sample the exemplar questions once per seed so the follow-up system prompt is identical
+    # across this seed's k generations and stays prompt-cacheable
+    candidates = [q for q in example_pool if str(q["qid"]) != str(question["qid"])]
+    n_examples = min(n_example_qa_pairs, len(candidates))
+    example_qa_pairs = [
+        {"qid": candidates[i]["qid"], "question": candidates[i]["question"], "answer": candidates[i]["answer"]}
+        for i in rng.choice(len(candidates), size=n_examples, replace=False)
+    ] if n_examples > 0 else []
+    example_qids = [str(qa["qid"]) for qa in example_qa_pairs]
+    ctx.tracer.emit(id="example_qa_pairs_sampled", data={"qid": question["qid"], "example_qids": example_qids})
+
     # generate line of inquiry (repeat until it is unique)
-    inquiry_tries = 1
-    line_of_inquiry = await _generate_line_of_inquiry(question, ctx, inquiry_tries, stats, collection, document_map)
-    inquiry_is_unique = await _is_inquiry_unique(line_of_inquiry["line_of_inquiry"], question, ctx, inquiry_tries, stats, inquiry_collection, LINE_OF_INQUIRY_LOCK)
+    inquiry_tries, duplicate_feedback = 1, {}
+    line_of_inquiry = await _generate_line_of_inquiry(question, duplicate_feedback, ctx, inquiry_tries, stats, collection, document_map)
+    inquiry_is_unique, duplicate_feedback = await _is_inquiry_unique(line_of_inquiry["line_of_inquiry"], question, ctx, inquiry_tries, stats, inquiry_collection, LINE_OF_INQUIRY_LOCK)
 
     while not inquiry_is_unique and inquiry_tries < MAX_INQUIRY_TRIES:
         inquiry_tries += 1
-        ctx.emit(f"line_of_inquiry_not_unique qid={question['qid']} line_of_inquiry={line_of_inquiry['line_of_inquiry']!r}")
-        line_of_inquiry = await _generate_line_of_inquiry(question, ctx, inquiry_tries, stats, collection, document_map)
-        inquiry_is_unique = await _is_inquiry_unique(line_of_inquiry["line_of_inquiry"], question, ctx, inquiry_tries, stats, inquiry_collection, LINE_OF_INQUIRY_LOCK)
+        ctx.tracer.emit(
+            id="line_of_inquiry_not_unique",
+            data={
+                "qid": question['qid'],
+                "line_of_inquiry": line_of_inquiry['line_of_inquiry'],
+            }
+        )
+        line_of_inquiry = await _generate_line_of_inquiry(question, duplicate_feedback, ctx, inquiry_tries, stats, collection, document_map)
+        inquiry_is_unique, duplicate_feedback = await _is_inquiry_unique(line_of_inquiry["line_of_inquiry"], question, ctx, inquiry_tries, stats, inquiry_collection, LINE_OF_INQUIRY_LOCK)
 
     if not inquiry_is_unique:
         raise Exception("Exceeded MAX_INQUIRY_TRIES")
@@ -606,16 +699,18 @@ async def generate_follow_up_questions(
     }]
     for idx in range(k):
         qa_pair_tries = 1
+        duplicate_feedback = {}
         n_docs = max(1, round(rng.normal(loc=docs_mean, scale=docs_std)))
-        qa_pair = await _generate_follow_up_question(idx, n_docs, question, qa_pairs, line_of_inquiry, qa_pair_tries, stats, ctx, collection, document_map)
+        n_nuggets = max(1, round(rng.normal(loc=nuggets_mean, scale=nuggets_std)))
+        qa_pair = await _generate_follow_up_question(idx, n_docs, n_nuggets, question, qa_pairs, line_of_inquiry, example_qa_pairs, duplicate_feedback, qa_pair_tries, stats, ctx, collection, document_map)
         solvable = await _is_solvable(qa_pair, question["qid"], idx, qa_pair_tries, solver_llm_client, stats, ctx, document_map)
-        qa_pair_is_unique = await _is_qa_pair_unique(qa_pair, question["qid"], idx, solvable, qa_pair_tries, stats, ctx, qa_collection, QA_PAIR_LOCK)
+        qa_pair_is_unique, duplicate_feedback = await _is_qa_pair_unique(qa_pair, question["qid"], idx, solvable, qa_pair_tries, stats, ctx, qa_collection, QA_PAIR_LOCK)
 
         while (not solvable or not qa_pair_is_unique) and qa_pair_tries < MAX_QA_PAIR_TRIES:
             qa_pair_tries += 1
-            qa_pair = await _generate_follow_up_question(idx, n_docs, question, qa_pairs, line_of_inquiry, qa_pair_tries, stats, ctx, collection, document_map)
+            qa_pair = await _generate_follow_up_question(idx, n_docs, n_nuggets, question, qa_pairs, line_of_inquiry, example_qa_pairs, duplicate_feedback, qa_pair_tries, stats, ctx, collection, document_map)
             solvable = await _is_solvable(qa_pair, question["qid"], idx, qa_pair_tries, solver_llm_client, stats, ctx, document_map)
-            qa_pair_is_unique = await _is_qa_pair_unique(qa_pair, question["qid"], idx, solvable, qa_pair_tries, stats, ctx, qa_collection, QA_PAIR_LOCK)
+            qa_pair_is_unique, duplicate_feedback = await _is_qa_pair_unique(qa_pair, question["qid"], idx, solvable, qa_pair_tries, stats, ctx, qa_collection, QA_PAIR_LOCK)
 
         if not solvable or not qa_pair_is_unique:
             raise Exception("Exceeded MAX_QA_PAIR_TRIES")
@@ -630,9 +725,10 @@ async def generate_follow_up_questions(
             "answer": qa_pair["answer"],
             "doc_ids": qa_pair["doc_ids"],
             "n_docs_target": n_docs,
+            "n_nuggets_target": n_nuggets,
         })
 
-    return qa_pairs, stats
+    return qa_pairs, stats, example_qids
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Run the question-answer synthesis script.")
@@ -705,6 +801,13 @@ def parse_arguments():
         help="the number of follow-up questions to generate for each real benchmark question",
     )
     parser.add_argument(
+        "--n-example-qa-pairs",
+        type=int,
+        default=5,
+        help="number of real benchmark question-answer pairs (sampled once per seed question, excluding the seed itself) "
+             "shown to the follow-up question agent as style/difficulty exemplars; 0 disables (default: 5)",
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=32,
@@ -735,8 +838,12 @@ def _run_question(
     k: int,
     docs_mean: float,
     docs_std: float,
+    nuggets_mean: float,
+    nuggets_std: float,
     question: dict,
-    config: OrchestratorConfig,
+    example_pool: list[dict],
+    n_example_qa_pairs: int,
+    config: SkunkConfig,
     collection: Collection,
     document_map: DocumentMap,
     inquiry_collection: Collection,
@@ -787,22 +894,26 @@ def _run_question(
     # create execution context and generate questions
     qid = str(question["qid"])
     ctx = ExecutionContext(
-        question=question["question"],
-        config=config,
-        document_map=document_map,
-        uid=qid,
         llm_client=llm_client,
+        config=config,
+        tracer=Tracer(
+            log_path=str(run_dir / "traces" / f"{qid}.jsonl"),
+            start_time=time.monotonic(),
+            verbose=True,
+        ),
+        document_map=document_map,
         chroma_collection=collection,
-        log_path=str(run_dir / "traces" / f"{qid}.jsonl"),
-        verbose=True,
     )
     stats: list[GenStats] = []
+    example_qids: list[str] = []
     failed, error_str = False, ""
     t0 = time.monotonic()
     try:
-        qa_pairs, stats = asyncio.run(
+        qa_pairs, stats, example_qids = asyncio.run(
             generate_follow_up_questions(
-                k, docs_mean, docs_std, question, stats, ctx, solver_llm_client, collection, document_map, inquiry_collection, qa_collection,
+                k, docs_mean, docs_std, nuggets_mean, nuggets_std,
+                question, example_pool, n_example_qa_pairs,
+                stats, ctx, solver_llm_client, collection, document_map, inquiry_collection, qa_collection,
             )
         )
     except Exception as e:  # a failed question must not sink the rest of the run
@@ -811,12 +922,13 @@ def _run_question(
         failed = True
         qa_pairs = []
     finally:
-        ctx.close()
+        ctx.tracer.close()
 
     record = {
         "qid": qid,
         "seed_question": question["question"],
         "seed_answer": question["answer"],
+        "example_qids": example_qids,
         "qa_pairs": qa_pairs,
         "wall_latency_s": round(time.monotonic() - t0, 3),
         "cost_usd": sum(s.cost_usd for s in stats),
@@ -865,8 +977,12 @@ def main() -> None:
     # load the set of questions
     print("Loading questions...")
     questions = load_questions(args.benchmark, args.split)
+
+    # exemplars for the follow-up prompt are drawn from the FULL split (never truncated by --limit,
+    # and never from another split, so test questions can't leak into dev-seeded generations)
+    example_pool = questions
     if args.limit is not None:
-        questions = questions[: args.limit]
+        questions = questions[:args.limit]
 
     # get mapping from document ID to document text for the benchmark data from ChromaDB
     print("Loading document map...")
@@ -883,13 +999,14 @@ def main() -> None:
     # get the mean and std for the number of relevant chunks per question for this benchmark
     assert args.benchmark in BENCHMARK_CHUNKS_STATS, f"no chunk stats for benchmark {args.benchmark}"
     docs_mean, docs_std = BENCHMARK_CHUNKS_STATS[args.benchmark]
+    nuggets_mean, nuggets_std = BENCHMARK_NUGGETS_STATS[args.benchmark]
 
     # set the pdf_dir based on the benchmark (if applicable)
     pdf_dir = None
     if args.benchmark == "officeqa":
         pdf_dir = str(OFFICEQA_PDF_DIR)
 
-    # create an OrchestratorConfig and InferenceConfig for the LLM client
+    # create a SkunkConfig and InferenceConfig for the LLM client
     inference_config = InferenceConfig(
         llm_provider="openrouter",
         llm_model=args.model_id,
@@ -904,9 +1021,9 @@ def main() -> None:
         llm_prices=LLM_PRICES,
         llm_context_limits=LLM_CONTEXT_LIMITS,
     )
-    config = OrchestratorConfig(
-        search=SearchAgentConfig(name=""),
-        lookup=LookupAgentConfig(name=""),
+    config = SkunkConfig(
+        search=SearchAgentConfig(name="", agent_id=""),
+        lookup=LookupAgentConfig(name="", agent_id=""),
         inference=inference_config,
         storage=StorageConfig(args.chroma_collection_name, args.chroma_host, args.chroma_port, pdf_dir=pdf_dir),
     )
@@ -945,8 +1062,8 @@ def main() -> None:
         print("Submitting futures...")
         futures = [
             pool.submit(
-                _run_question, args.k, docs_mean, docs_std, q, config,
-                collection, document_map, inquiry_collection, qa_collection, run_dir,
+                _run_question, args.k, docs_mean, docs_std, nuggets_mean, nuggets_std,
+                q, example_pool, args.n_example_qa_pairs, config, collection, document_map, inquiry_collection, qa_collection, run_dir,
             )
             for q in questions
             if str(q["qid"]) not in finished_qids

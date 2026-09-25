@@ -7,7 +7,6 @@ from typing import Generator
 from skunk.chroma_client import make_chroma_client
 from skunk.search_state.working_set import WorkingSet
 
-WS_PREFIX = "ws_"
 DEFAULT_CHROMA_PATH = str(Path.home() / ".skunk" / "chromadb")
 
 class WorkingSetRegistry:
@@ -53,7 +52,7 @@ class WorkingSetRegistry:
         """
         registry: dict[str, WorkingSet] = {}
         for c in self.client.list_collections():
-            if not c.name.startswith(WS_PREFIX):
+            if not c.metadata.get("is_working_set"):
                 continue
             # a ws collection with metadata=None is mid-creation by another agent or an
             # orphan of a run that crashed between create and modify — unusable, skip it

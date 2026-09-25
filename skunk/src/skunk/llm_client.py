@@ -355,7 +355,7 @@ class _LLMBackend:
     async def acall(self, spec: CallSpec) -> LLMResponse:
         return await self._aretry_call(lambda: self._gen_acall(spec), self.provider, spec.model)
 
-    def embed_query(self, text: str, *, model: str, usage_key: str = "default", http_headers: dict[str, str] | None = None) -> list[float]:
+    def embed_query(self, text: str, *, model: str, usage_key: str = "default", http_headers: dict[str, str] | None = None, timeout_s: float | None = None) -> list[float]:
         """Embed a single query string for vector search, routing through the same
         rate-limit / retry / usage-accounting scaffolding as generation so embedding
         spend lands on this client's `usage` tracker (tokens, cost, calls). The provider
@@ -365,7 +365,7 @@ class _LLMBackend:
 
         def attempt() -> list[float]:
             t0 = time.monotonic()
-            vector, in_tok = self._embed_once(model, text, http_headers=http_headers)
+            vector, in_tok = self._embed_once(model, text, http_headers=http_headers, timeout_s=timeout_s)
             latency_s = time.monotonic() - t0
             self.usage.add_embed(model, in_tok, usage_key)
             if self._tracer is not None:
@@ -398,7 +398,7 @@ class _LLMBackend:
     async def _gen_acall(self, spec: CallSpec) -> LLMResponse:
         raise NotImplementedError(f"provider {self.provider!r} does not implement acall")
 
-    def _embed_once(self, model: str, text: str, http_headers: dict[str, str] | None = None) -> tuple[list[float], int]:
+    def _embed_once(self, model: str, text: str, http_headers: dict[str, str] | None = None, timeout_s: float | None = None) -> tuple[list[float], int]:
         """One embedding request (no retry — the retry loop owns that). Returns the
         vector and the provider-reported input-token count (0 when unreported)."""
         raise NotImplementedError(f"provider {self.provider!r} does not implement embed_query")
@@ -806,12 +806,17 @@ class _OpenRouterBackend(_OpenAIChatBackend):
         self._tpm_settle(tpm_lim, est, toks["input_tokens"])
         return self._finish(spec, output_text, toks, latency_s, spec.model)
 
-    def _embed_once(self, model: str, text: str, http_headers: dict[str, str] | None = None) -> tuple[list[float], int]:
+    def _embed_once(self, model: str, text: str, http_headers: dict[str, str] | None = None, timeout_s: float | None = None) -> tuple[list[float], int]:
         """One OpenRouter embeddings call (e.g. Qwen3-Embedding-8B). Token count is the
         provider-reported `usage.prompt_tokens`. `http_headers` are sent on this request
         only (e.g. x-session-id for OpenRouter session attribution; OpenRouter ignores a
         body session_id on the embeddings endpoint)."""
-        resp = self._get_client().embeddings.generate(input=text, model=model, http_headers=dict(http_headers) if http_headers else None)
+        resp = self._get_client().embeddings.generate(
+            input=text,
+            model=model,
+            http_headers=dict(http_headers) if http_headers else None,
+            timeout_ms=None if timeout_s is None else int(timeout_s * 1000.0),
+        )
         data = getattr(resp, "data", None) or []
         vector = list(data[0].embedding) if data and data[0].embedding else []
         if not vector:
@@ -897,12 +902,16 @@ class _VLLMBackend(_OpenAIChatBackend):
         self._tpm_settle(tpm_lim, est, toks["input_tokens"])
         return self._finish(spec, output_text, toks, latency_s, spec.model)
 
-    def _embed_once(self, model: str, text: str, http_headers: dict[str, str] | None = None) -> tuple[list[float], int]:
+    def _embed_once(self, model: str, text: str, http_headers: dict[str, str] | None = None, timeout_s: float | None = None) -> tuple[list[float], int]:
         """One vLLM embeddings call (server started with `--task embed`). Token count is
         the server-reported `usage.prompt_tokens`."""
         # http_headers unused: local vLLM has no per-session attribution
         client, _ = self._clients_for(model)
-        resp = client.embeddings.create(model=model, input=text)
+        resp = (
+            client.embeddings.create(model=model, input=text)
+            if timeout_s is None
+            else client.embeddings.create(model=model, input=text, timeout=timeout_s)
+        )
         data = getattr(resp, "data", None) or []
         vector = list(data[0].embedding) if data and data[0].embedding else []
         if not vector:
@@ -1039,6 +1048,7 @@ class LLMClient:
         provider: str | None = None,
         usage_key: str = "default",
         http_headers: dict[str, str] | None = None,
+        timeout_s: float | None = None,
     ) -> list[float]:
         """Embed a single query string for vector search (see `_LLMBackend.embed_query`
         for the retry/usage envelope).
@@ -1049,4 +1059,4 @@ class LLMClient:
             from `config.vllm_base_urls[model]`, same map as generation."""
         model = model or self._config.emb_model_id
         provider = provider or self._config.emb_provider
-        return self._backend(provider).embed_query(text, model=model, usage_key=usage_key, http_headers=http_headers)
+        return self._backend(provider).embed_query(text, model=model, usage_key=usage_key, http_headers=http_headers, timeout_s=timeout_s)

@@ -1,17 +1,37 @@
 # Synthetic OfficeQA benchmark: LLM-generated QA pairs over the Treasury Bulletin corpus,
 # grouped into ~6-question "lines of inquiry" over shared document sets (dataset_datagen).
-# Inherits the officeqa corpus, chroma collection, page map, and scorer; only the question
-# source differs. File order groups each line of inquiry consecutively, so a sequential
-# (workers=1) run exercises working-set reuse across related questions.
+# Inherits the officeqa corpus, chroma collection, and page map; the question source differs
+# and answers are lists of nuggets, so scoring is LLM-judged nugget recall (needs judge_model).
+# File order groups each line of inquiry consecutively, so a sequential (workers=1) run
+# exercises working-set reuse across related questions.
+#
+# Run on the v2 set (dataset_datagen/output/officeqa-dev-v2) with:
+#   python3 -m qatfd.runner systems=codex benchmarks=officeqa_synth \
+#       benchmarks.qa_pairs_path=officeqa/synth_dev_v2_qa_pairs.json benchmarks.judge_model=<judge-model> \
+#       experiments.run_name=<label> experiments.workers=4
 defaults:
   - officeqa
   - _self_
 
 name: officeqa_synth
-# LOI-grouped synthetic QA pairs (copied from dataset_datagen/output/officeqa-dev/qa_pairs.json)
-qa_pairs_path: officeqa/synth_dev_qa_pairs.json
+# LOI-grouped synthetic QA pairs. v1 (default, string+list answers; used by the search_agent ws
+# ablation) was copied from dataset_datagen/output/officeqa-dev/qa_pairs.json; v2 (nugget-list
+# answers) from dataset_datagen/output/officeqa-dev-v2/qa_pairs.json ->
+# officeqa/synth_dev_v2_qa_pairs.json; v3 (terra-generated with feedback-driven dedup, a 5-seed sample)
+# from dataset_datagen/output/smoke_uid0001_terra_20260915/qa_pairs.json -> officeqa/synth_dev_v3_qa_pairs.json.
+# Override on the CLI (or QA_PAIRS_PATH in scripts/run_codex_ablation.sh) to pick another file.
+qa_pairs_path: officeqa/synth_dev_v2_qa_pairs.json
+# llm used by the nugget-completion judge (REQUIRED: the benchmark refuses to build without it,
+# so a run can't spend on the system and then fail at scoring)
+judge_model: null
+# weight for a partially-supported nugget in the recall score
+partial_credit: 0.0
+# wall-clock cap (seconds) on one judge request (null = none); a timed-out request is retried by the client
+judge_timeout_s: 300
+# evaluate the seed (original OfficeQA) records too? default: follow-ups only
+include_seeds: false
 # no dev/test split: `experiments.split=dev` (the default) runs all questions
 splits_path: null
-codex_home: officeqa/codex/
-codex_scratch_dir: officeqa/codex-scratch/
+codex_config_toml: officeqa/codex/config.toml
+codex_agents_md: officeqa/codex/AGENTS.md
 codex_answer_schema_file: officeqa/answer_schema.json

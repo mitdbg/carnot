@@ -1,0 +1,226 @@
+
+search_corpus: |-
+  ### search_corpus(collections: list[str], query: str, top_k: int, metadata_filter: dict | None = None)
+  This tool performs a vector search over the specified `collection(s)` by embedding the input `query` and returning the `top_k` most relevant chunks, each labelled with its `chunk_id` and `doc_id`. You may better target the search by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata.
+
+  Supported `metadata_filter` syntax:
+  - Equality: `{"field": value}`
+  - Set membership: `{"field": {"$in": [v1, v2, ...]}}`
+  - Negation / not-in: `{"field": {"$nin": [...]}}`
+  - Compound: `{"$and": [clause1, clause2, ...]}` or `{"$or": [...]}`
+
+  Metadata fields for each collection will be provided below.
+
+# ```python
+# # find the 100 chunks most relevant to "topic X" anywhere in the base collection
+# search_corpus(["base"], "topic X", top_k=100)
+# ```
+
+# ```python
+# # find the 50 chunks most relevant to "topic Y" within a filtered subset of collections "col_1" and "col_2"
+# search_corpus(["col_1", "col_2"], "topic Y", top_k=50, metadata_filter={"$and": [{"field_a": "value_a"}, {"field_b": {"$in": [1, 2, 3]}}]})
+# ```
+
+
+grep_corpus: |-
+  ### grep_corpus(collections: list[str], pattern: str, metadata_filter: dict | None = None, limit: int | None = None)
+  This tool performs a regex search over the specified `collection(s)` and returns the matching chunks grouped by their `doc_id` then `chunk_id`. The output is unlimited by default (`limit=None`). This is useful for exhaustive queries -- "find every doc that mentions X" -- but you should pass `limit=N` for narrower exploratory searches. You may better target the search by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata.
+
+  Supported `metadata_filter` syntax:
+  - Equality: `{"field": value}`
+  - Set membership: `{"field": {"$in": [v1, v2, ...]}}`
+  - Negation / not-in: `{"field": {"$nin": [...]}}`
+  - Compound: `{"$and": [clause1, clause2, ...]}` or `{"$or": [...]}`
+
+  Metadata fields for each collection will be provided below.
+
+# ```python
+# # find every chunk that mentions "topic X" (case insensitive) across the base collection
+# grep_corpus(["base"], "(?i)topic X")
+# ```
+
+# ```python
+# # find chunks matching the literal phrase "topic Y" within a filtered subset of collections "col_1" and "col_2"; returns 50 hits per collection
+# grep_corpus(["col_1", "col_2"], "topic Y", metadata_filter={"field_a": {"$in": ["value_1", "value_2"]}}, limit=50)
+# ```
+
+
+read_document: |-
+  ### read_document(doc_ids: list[str], start_char_indices: list[int] | None = None, end_char_indices: list[int] | None = None)
+  This tool returns the text of one or more documents, given their `doc_ids`. You may specify `start_char_indices` and `end_char_indices` to fetch only a substring of each document. `start_char_indices` and `end_char_indices` must be lists of the same length as `doc_ids` or `None`, and each index pair will be applied to the corresponding document. If `end_char_indices` exceeds the document length, the document will be truncated to its actual length. If `start_char_indices` is negative, it counts from the end of the document. If `end_char_indices` is negative, it counts from the end of the document.
+
+# ```python
+# # read two specific documents by id
+# read_document(["doc_id_1", "doc_id_2"])
+# ```
+
+# ```python
+# # read the second 1000 characters of a document
+# read_document(["doc_id_3"], start_char_indices=[1000], end_char_indices=[2000])
+# ```
+
+# ```python
+# # read the last 1000 characters of a document and the full text of another document
+# read_document(["doc_id_4", "doc_id_5"], start_char_indices=[-1000, 0])
+# ```
+
+
+view_figure: |-
+  ### view_figure(doc_id: str)
+  When you read a document and see a `<figure id=N>` placeholder (a chart/figure that is NOT in the searchable text), call this tool to render it. It returns an image of the entire page — so you see the figure on the page in context — appended to your messages, just like reading the page's text. Use it to judge whether a page whose answer may live in a chart is relevant. Pass the `doc_id` of the page you want to read.
+
+# ```python
+# # the doc_id you read and saw "<figure id=5>"; now view the page
+# view_figure("<doc_id>")
+# ```
+
+prune: |-
+  ### prune(chunk_ids: list[str] | None = None, doc_ids: list[str] | None = None)
+  This tool removes `chunk_id`s and/or `doc_id`s that you've already inspected and deemed irrelevant from your visible context. Use this aggressively whenever a read surfaces clearly irrelevant chunks (or docs) to keep later searches focused and keep your context window manageable.
+
+# ```python
+# # mark some chunks and a whole doc as irrelevant
+# prune(chunk_ids=["chunk_id_1", "chunk_id_2"], doc_ids=["doc_id_3"])
+# ```
+
+
+sem_filter_judge: |-
+  You will be given an input and a filter condition. Return TRUE if the document satisfies the condition and FALSE otherwise. Do not emit an explanation, reasoning, or any other text.
+# sem_filter_judge: |-
+#   You will be given a batch of inputs (with ids) and a filter condition. Return a JSON dictionary mapping the input ids to "true" if the document satisfies the condition and "false" otherwise. Do not emit an explanation, reasoning, or any other text.
+
+
+# NOTE: if you modify this string; update the docstring in `qatfd/scripts/codex_mcp_server.py` to match.
+sem_filter_tool: |-
+  ### semantic_filter(collections: list[str], predicate: str, search_str: str | None = None, top_k: int | None = None, pattern: str | None = None, limit: int | None = None, metadata_filter: dict | None = None)
+  This tool returns documents from the specified `collection(s)` whose FULL text satisfies a natural-language `predicate`: candidates are selected from the corpus, each is judged independently by a cheap LLM (TRUE/FALSE), and the survivors are returned. To perform candidate selection, there are two options, each of which may accept a `metadata_filter`:
+
+  **Vector Search:** to perform candidate selection with vector search, specify the parameters `top_k` and optionally `search_str`. Vector search will select the `top_k` most relevant chunks — embedding `search_str` if given, else the predicate; prefer a short focused `search_str` when the predicate is long or compound.
+
+  **Grep:** to perform candidate selection with grep, specify the parameters `pattern` and optionally `limit`. The tool will filter for candidate chunks whose text matches the regular expression.
+  
+  Each of these may be combined with a `metadata_filter` (a ChromaDB-style where clause over chunk metadata) for more targeted searches.
+
+  Supported `metadata_filter` syntax:
+  - Equality: `{"field": value}`
+  - Set membership: `{"field": {"$in": [v1, v2, ...]}}`
+  - Negation / not-in: `{"field": {"$nin": [...]}}`
+  - Compound: `{"$and": [clause1, clause2, ...]}` or `{"$or": [...]}`
+
+  Candidate chunks are deduped to their parent documents before judging.
+
+
+# ```python
+# # vector prefilter: judge the documents in the base collection behind the 200 chunks nearest a short query
+# semantic_filter(
+#     collections=["base"],
+#     predicate="describes a government intervention in response to a labor strike, naming the statute invoked",
+#     top_k=200,
+#     search_str="government intervention strike",
+# )
+
+# # grep prefilter: judge the documents which match the regular expression in collection "col_1"
+# semantic_filter(
+#     collections=["col_1"],
+#     predicate="The document is a legal contract between ACME Corp. and one of their suppliers",
+#     pattern=r"(?i)ACME Corp(oration|\.)",
+# )
+
+# # metadata + vector prefilter: restrict candidates in "col_1" and "col_2" to a subset of years, then judge the documents behind the 300 nearest chunks
+# semantic_filter(
+#     collections=["col_1", "col_2"],
+#     predicate="reports a change in the interest rate set by the central bank, stating the new rate",
+#     top_k=300,
+#     search_str="central bank interest rate change",
+#     metadata_filter={"year": {"$in": ["1951", "1952", "1953"]}},
+# )
+
+# # metadata + grep prefilter: within a filtered subset of "col_1", judge the documents matching the regex (capped at 500 candidate chunks)
+# semantic_filter(
+#     collections=["col_1"],
+#     predicate="attributes a production slowdown to a shortage of a specific raw material",
+#     pattern=r"(?i)shortage",
+#     limit=500,
+#     metadata_filter={"$and": [{"field_a": "value_a"}, {"year": {"$nin": ["1946"]}}]},
+# )
+# ```
+
+sem_map_judge: |-
+  You will be given an input (with associated metadata) and a set of fields to compute. Return a JSON dictionary whose keys correspond to the field names and whose values you compute based on the field description and type. If you cannot extract a value for the field given the input context, set its value to `None`. Do not emit an explanation, reasoning, or any other text.
+# sem_map_judge: |-
+#   You will be given a batch of inputs (with associated metadata) and a set of fields to compute. Return a list of JSON dictionaries whose keys correspond to the field names and whose values you compute based on the field description and type. If you cannot extract a value for the field given the input context, set its value to `None`. Order the dictionaries in your response to match the indices of the inputs within the batch. Do not emit an explanation, reasoning, or any other text.
+
+
+sem_map_tool: |-
+  ### semantic_map(collections: list[str], metadata_fields: list[dict], doc_level: bool = False)
+  This tool maps over the specified `collection(s)` and uses a cheap LLM to compute the values for the `metadata_fields`. If `doc_level=False` (the default) the semantic map is applied over every chunk. If `doc_level=True`, the map is applied over every document with field values assigned to each chunk within that document.
+
+  For each input the LLM sees the text AND the input's existing metadata (its `chunk_id` / `doc_id` and any fields computed by earlier maps), so a field may be derived from the ids or from earlier fields as well as from the text (e.g. a bulletin's year from a `doc_id` of the form "<year>_<month>_<page>").
+
+  Each metadata field must be specified by a dictionary with three keys:
+    - name: the name of the metadata field
+    - desc: a short natural language description for the field
+    - type: the Python type of the field
+
+  It's best practice to batch as many `metadata_fields` into one tool call as possible. This cuts down on duplicate input data processing.
+
+
+map_tool: |-
+  ### map_collections(collections: list[str], map_fn: Callable[[str, dict], dict[str, str | int | float | bool | None]], fields: list[dict], doc_level: bool = False)
+  This tool maps over the specified `collection(s)` and uses a function `map_fn` to compute metadata fields for each input. If `doc_level=False` (the default) the map is applied over every input chunk. If `doc_level=True`, the map is applied over every input document with field values assigned to each chunk within that document.
+
+  `map_fn` takes the input text and its metadata dictionary (i.e. `map_fn(text: str, metadata: dict[str, Any])`) and returns a dictionary whose keys are the field names and whose values are the field values. `metadata` always carries `chunk_id` and `doc_id` (for `doc_level=True`: `doc_id` plus the fields shared by all of the document's chunks) and any fields computed by earlier maps, so e.g. `lambda text, meta: {"year": int(meta["doc_id"].split("_")[0])}` derives a field from the id without touching the text. Returned values must be scalars (str / int / float / bool / None); `chunk_id` and `doc_id` cannot be overwritten. `fields` declares, up front, the fields that `map_fn` produces so they can be recorded in the collection's metadata schema; each field must be specified by a dictionary with three keys:
+    - name: the name of the metadata field (must match the key returned by `map_fn`)
+    - desc: a short natural language description for the field
+    - type: the Python type of the field
+
+
+create_collection: |-
+  ### create_collection(name: str, description: str, results: ResultSet | None = None, *, from_collections: list[str] | None = None, metadata_filter: dict | None = None)
+  This tool creates a new collection called `name` with a short natural-language `description` of what it contains, and optionally populates it. There are two ways to populate a collection (they may be combined):
+    - `results`: the value returned by `search_corpus` or `grep_corpus`. Results support set algebra over chunks -- `a | b` (union), `a & b` (intersection), `a - b` (difference) -- and `a.where(fn)` keeps only the chunks whose metadata dict satisfies `fn`. Assign tool results to variables and pass them here.
+    - `from_collections` (+ optional `metadata_filter`): copy every chunk of the given collection(s) that matches the ChromaDB-style `metadata_filter` (same syntax as `search_corpus`). This is the way to build a collection from a (large) filtered subset of an existing collection, e.g. after `semantic_map` has computed a discriminative field.
+
+  Chunks keep their `chunk_id`, `doc_id`, embedding, and metadata, so a collection never holds duplicate chunks and searching it behaves exactly like searching the base collection. The new collection inherits the metadata fields of the collection(s) it is populated from. Names must be 3-512 characters from [a-zA-Z0-9._-].
+
+# ```python
+# # preview first (small top_k / limit), then build the collection in one block
+# hits = search_corpus(["base"], "monetary policy in 1946", top_k=300)
+# mentions = grep_corpus(["base"], "(?i)federal reserve", metadata_filter={"year": 1946})
+# create_collection("fed_policy_1946", "Chunks about Federal Reserve monetary policy in 1946", hits | mentions)
+# ```
+
+# ```python
+# # a filtered subset of an existing collection, copied server-side
+# create_collection("tables_2001", "All table chunks from 2001 bulletins", from_collections=["base"], metadata_filter={"$and": [{"type": "table"}, {"year": 2001}]})
+# ```
+
+
+add_to_collection: |-
+  ### add_to_collection(name: str, results: ResultSet | None = None, *, from_collections: list[str] | None = None, metadata_filter: dict | None = None)
+  This tool adds chunks to the existing collection `name`. `results`, `from_collections`, and `metadata_filter` work exactly as in `create_collection`. Adding a chunk that is already in the collection is a no-op (no duplicates), so it is safe to re-add overlapping results. The collection inherits any metadata fields of the collection(s) the chunks come from. The base collection cannot be modified.
+
+# ```python
+# more = grep_corpus(["base"], "(?i)open market committee")
+# add_to_collection("fed_policy_1946", more.where(lambda m: m.get("year") == 1946))
+# ```
+
+
+delete_collection: |-
+  ### delete_collection(name: str)
+  This tool permanently deletes the collection `name`. Only collections created by agents can be deleted; the base collection cannot.
+
+
+merge_collections: |-
+  ### merge_collections(sources: list[str], dst: str, description: str, *, metadata_filter: dict | None = None)
+  This tool creates a new collection `dst` (with the given `description`) containing the union of the chunks in `sources`, de-duplicated by `chunk_id`. If `metadata_filter` is given, only the chunks matching it are merged. The source collections are left unchanged; delete them afterwards if they are no longer needed.
+
+
+copy_collection: |-
+  ### copy_collection(src: str, dst: str, description: str | None = None, *, metadata_filter: dict | None = None)
+  This tool creates a new collection `dst` containing the chunks of `src`, or only those matching `metadata_filter` if one is given. `description` defaults to a description derived from `src`. Use it to carve a sub-collection out of an existing one, or to snapshot a collection before a risky operation.
+
+
+list_collections: |-
+  ### list_collections()
+  This tool lists the base collection and every agent-managed collection, with each one's description, number of chunks, metadata fields, and the history of the actions that built it.

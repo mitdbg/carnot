@@ -1,10 +1,12 @@
 # run-level knobs (maps onto qatfd.config.ExperimentConfig).
+run_name: null      # label prefix for the run directory (mandatory; timestamp is always appended)
 split: dev          # dev | test  (test = held-out set; deliberate final runs only)
 sample: null        # cap to N randomly-sampled questions from the split (null = all)
-seed: null          # RNG seed for `sample`; set it to draw the same subset across systems (null = nondeterministic)
+sample_seed: null   # RNG seed for `sample`; set it to draw the same subset across systems (null = nondeterministic)
+shuffle_seed: null  # RNG seed for shuffling qids to test different orderings of the questions in sequential runs
+shuffle_group_key: null  # shuffle GROUPS of questions (a Question.meta key, e.g. loi_idx) instead of single questions
 qids: null          # explicit qids to run, list[str] (overrides split/sample)
 workers: 32         # question-level concurrency (ThreadPoolExecutor)
-run_name: ""        # label prefix for the run directory (timestamp is always appended)
 console: false      # also stream per-question logs to the console
 resume_dir: null    # resume an interrupted run: path to its run dir; finished questions (in results.jsonl) are skipped
-run_mode: parallel  # run benchmark questions in 'parallel', 'sequential', or 'all'
+run_mode: parallel  # run benchmark questions in 'parallel' or 'sequential'

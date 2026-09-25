@@ -34,6 +34,11 @@ _JUDGE_UUID = uuid.uuid4()
 # reply never loses the verdict.
 _JUDGE_MAX_OUTPUT_TOKENS = 1024
 
+# Wall-clock cap on one judge request. Without it a request the provider never answers hangs until
+# the upstream proxy drops the connection (~100 min observed on OpenRouter, 2026-09-14); with it the
+# client's retry loop gets a fresh attempt after `timeout_s`.
+JUDGE_TIMEOUT_S = 300.0
+
 _YESNO_RE = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
 
 
@@ -44,7 +49,8 @@ def _parse_yes_no(text: str) -> bool:
 
 
 async def judge_single_nugget(
-    ctx: ExecutionContext, *, question: str, gold: str, predicted: str, model: str, usage_key: str | None = None
+    ctx: ExecutionContext, *, question: str, gold: str, predicted: str, model: str, usage_key: str | None = None,
+    timeout_s: float | None = JUDGE_TIMEOUT_S,
 ) -> dict:
     user = f"Question:\n{question}\n\nGold answer:\n{gold}\n\nPredicted answer:\n{predicted or '(no answer)'}"
     messages = [
@@ -55,9 +61,9 @@ async def judge_single_nugget(
         messages=messages,
         temperature=0.0,
         model=model,
-        ctx=ctx,
         call_site="bcp_judge",
         max_output_tokens=_JUDGE_MAX_OUTPUT_TOKENS,
+        timeout_s=timeout_s,
         usage_key=usage_key if usage_key is not None else str(_JUDGE_UUID),
     )
     rationale = (resp.text or "").strip()
@@ -127,6 +133,7 @@ async def judge_nugget_recall(
     judge_system: str,
     partial_credit: float = 0.0,
     usage_key: str | None = None,
+    timeout_s: float | None = JUDGE_TIMEOUT_S,
 ) -> dict:
     """Nugget recall (KARL TREC-BioGen): one judge call labels every gold nugget against the
     predicted answer; score = (n_support + partial_credit * n_partial) / n_nuggets.
@@ -153,9 +160,9 @@ async def judge_nugget_recall(
         messages=messages,
         temperature=0.0,
         model=model,
-        ctx=ctx,
         call_site="biogen_nugget_judge",
         usage_key=usage_key if usage_key is not None else str(_JUDGE_UUID),
+        timeout_s=timeout_s,
     )
     labels = _parse_labels(resp.text or "", len(nuggets))
     weights = [partial_credit if lab == "partial_support" else _LABEL_WEIGHTS[lab] for lab in labels]

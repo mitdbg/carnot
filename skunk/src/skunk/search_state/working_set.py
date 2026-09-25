@@ -136,8 +136,9 @@ class WorkingSet:
             "pruned_chunk_ids", "pruned_doc_ids", "read_chunk_ids", "read_doc_ids",
             "fetched_chunk_ids", "fetched_doc_ids", "actions", "parent_working_set_ids",
         )
-        metadata = {key: "" for key in keys}
+        metadata: dict[str, str | bool] = {key: "" for key in keys}
         metadata["summary"] = "(Summary not yet computed.)"
+        metadata["is_working_set"] = True
         return metadata
 
     def get_metadata(self) -> dict:

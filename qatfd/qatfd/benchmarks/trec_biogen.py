@@ -20,10 +20,11 @@ from __future__ import annotations
 
 import json
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
 from typing import cast
 
 from chromadb import Collection
+from chromadb.api import ClientAPI
+from chromadb.errors import NotFoundError
 
 from skunk.common import ExecutionContext
 
@@ -31,6 +32,7 @@ from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.judge import judge_nugget_recall
 from qatfd.config import TrecBiogenConfig
 from qatfd.constants import TREC_BIOGEN
+from qatfd.merged_chroma import MergedClient, MergedCollection, Shard  # noqa: F401  (MergedCollection re-exported)
 from qatfd.paths import resolve_under_benchmarks
 from qatfd.types import Question
 
@@ -84,92 +86,6 @@ class _ChromaDocMap:
 
     def __contains__(self, doc_id) -> bool:
         return self.get(doc_id) is not None
-
-
-class MergedCollection:
-    """Duck-typed stand-in for a chromadb ``Collection`` that fans a query/get out across N shard
-    collections and merges the results, so the SearchAgent and the doc map can treat a sharded
-    corpus as one collection. BioGen's 26.8M abstracts are split into one collection per embedding
-    rank (``f"{base}_r{i}"``) because chromadb 1.5.x's metadata-segment compaction fails on a single
-    collection that large; each ~6.7M-row shard compacts fine.
-
-    Only the methods skunk's retrieval actually calls are implemented — ``query`` (search_corpus),
-    ``get`` (grep_corpus + the doc map), and ``count`` (verification). A PMID lives in exactly one
-    shard (a doc's chunks all come from one source file -> one rank), so ``get`` by id/where simply
-    concatenates and the lone owning shard supplies the hit."""
-
-    def __init__(self, collections: list) -> None:
-        assert collections, "MergedCollection needs at least one shard collection"
-        self._collections = collections
-
-    @property
-    def name(self) -> str:
-        return self._collections[0].name
-
-    def count(self) -> int:
-        return sum(self._fanout(lambda c: c.count()))
-
-    def _fanout(self, fn):
-        """Run ``fn(collection)`` across all shards concurrently, results in shard order. Parallel
-        fan-out is a latency win and is safe when the shards are separate chroma SERVERS (each owns
-        its own concurrency) — which is how sharded biogen must be served, since the embedded
-        PersistentClient serializes/deadlocks under in-process concurrency."""
-        if len(self._collections) == 1:
-            return [fn(self._collections[0])]
-        with ThreadPoolExecutor(max_workers=len(self._collections)) as ex:
-            return list(ex.map(fn, self._collections))
-
-    def query(self, **kwargs) -> dict:
-        """Run the same query on every shard (concurrently), then keep the globally closest
-        ``n_results`` by distance (chroma's default L2 space: smaller = closer)."""
-        n_results = kwargs.get("n_results", 10)
-        include = kwargs.get("include") or ["metadatas", "documents", "distances"]
-        rows: list[tuple] = []
-        for r in self._fanout(lambda c: c.query(**kwargs)):
-            ids = (r.get("ids") or [[]])[0]
-            n = len(ids)
-            dists = (r.get("distances") or [[None] * n])[0]
-            docs = (r.get("documents") or [[None] * n])[0]
-            metas = (r.get("metadatas") or [[None] * n])[0]
-            for i in range(n):
-                rows.append((dists[i], ids[i], docs[i], metas[i]))
-        # None distances (shouldn't happen when "distances" is included) sort last, deterministically.
-        rows.sort(key=lambda t: (t[0] is None, t[0] if t[0] is not None else 0.0))
-        rows = rows[:n_results]
-        out: dict = {"ids": [[t[1] for t in rows]]}
-        if "distances" in include:
-            out["distances"] = [[t[0] for t in rows]]
-        if "documents" in include:
-            out["documents"] = [[t[2] for t in rows]]
-        if "metadatas" in include:
-            out["metadatas"] = [[t[3] for t in rows]]
-        return out
-
-    def get(self, **kwargs) -> dict:
-        """Concatenate ``get`` across shards (each PMID is in one shard). Honors ``limit`` as a
-        global cap, short-circuiting once enough rows are collected."""
-        limit = kwargs.get("limit")
-        include = kwargs.get("include") or []
-        ids_acc: list = []
-        docs_acc: list = []
-        metas_acc: list = []
-        want_docs = want_metas = False
-        for r in self._fanout(lambda c: c.get(**kwargs)):
-            ids_acc.extend(r.get("ids") or [])
-            if r.get("documents") is not None:
-                want_docs = True
-                docs_acc.extend(r["documents"])
-            if r.get("metadatas") is not None:
-                want_metas = True
-                metas_acc.extend(r["metadatas"])
-        if limit is not None:
-            ids_acc, docs_acc, metas_acc = ids_acc[:limit], docs_acc[:limit], metas_acc[:limit]
-        out: dict = {"ids": ids_acc}
-        if want_docs or "documents" in include:
-            out["documents"] = docs_acc
-        if want_metas or "metadatas" in include:
-            out["metadatas"] = metas_acc
-        return out
 
 
 class TrecBiogenBenchmark(Benchmark):
@@ -243,17 +159,20 @@ class TrecBiogenBenchmark(Benchmark):
 
     # ---- retrieval substrate --------------------------------------------------
 
-    def _open_collection(self):
+    def _open_collection(self) -> tuple[Collection, ClientAPI]:
         """Single collection, or a MergedCollection over `chroma_server_num_shards` per-rank shards
-        (`f"{collection_name}_r{i}"`). Each shard was built in its OWN chroma dir — its own
-        chroma.sqlite3 — so no single metadata segment reaches the scale where chromadb 1.5.x
-        compaction fails. Reads are server-only: with `chroma_server_shard_ports`, shard i is served by
-        its own warm server at (chroma_server_host, ports[i]) and queried in parallel; otherwise all
-        shards are opened by name from the single (chroma_server_host, chroma_server_port) server."""
+        (`f"{collection_name}_r{i}"`) served through a MergedClient. Each shard was built in its OWN
+        chroma dir — its own chroma.sqlite3 — so no single metadata segment reaches the scale where
+        chromadb 1.5.x compaction fails. Reads are server-only: with `chroma_server_shard_ports`, shard
+        i is served by its own warm server at (chroma_server_host, ports[i]) and queried in parallel;
+        otherwise all shards are opened by name from the single (chroma_server_host, chroma_server_port)
+        server. Either way the returned client routes any non-base collection (working sets,
+        agent-managed collections) to the one shard that holds it."""
         n = getattr(self.config, "chroma_server_num_shards", 1) or 1
         if n <= 1:
             return self._open_chroma_collection()
         base = self.config.storage.collection_name
+        host = self.config.storage.chroma_server_host
         # Each shard as its own warm chroma SERVER on its own port (run_chroma_server.sh per shard):
         # keeps HNSW resident across runs (no cold load). Queried in parallel by MergedCollection.
         ports = getattr(self.config, "chroma_server_shard_ports", None)
@@ -261,34 +180,33 @@ class TrecBiogenBenchmark(Benchmark):
             if len(ports) != n:
                 raise ValueError(f"chroma_server_shard_ports has {len(ports)} entries but chroma_server_num_shards={n}.")
             from skunk.chroma_client import make_chroma_client
-            host = self.config.storage.chroma_server_host
-            return MergedCollection(
-                [self._get_shard(make_chroma_client(host, p), f"{base}_r{i}", f"{host}:{p}")
-                 for i, p in enumerate(ports)]
-            )
-        client = self._chroma_client()
-        return MergedCollection([self._get_shard(client, f"{base}_r{i}", "server") for i in range(n)])
 
-    def _get_shard(self, client, name: str, where: str):
+            shards = [Shard(make_chroma_client(host, p), f"{base}_r{i}", f"{host}:{p}") for i, p in enumerate(ports)]
+        else:
+            client = self._chroma_client()
+            shards = [Shard(client, f"{base}_r{i}", self._chroma_where()) for i in range(n)]
         try:
-            return client.get_collection(name=name)
-        except Exception as e:
-            raise RuntimeError(f"biogen shard collection {name!r} not found ({where}).") from e
+            merged_client = MergedClient(base, shards)
+        except NotFoundError as e:
+            raise RuntimeError(f"biogen shard collection missing: {e}") from e
+        # MergedClient/MergedCollection are duck-typed stand-ins for ClientAPI/Collection; cast so the
+        # fiction stays local here and consumers keep treating them as the chromadb types.
+        return cast(Collection, merged_client.get_collection(base)), cast(ClientAPI, merged_client)
 
     def _build_resources(self) -> BenchmarkResources:
-        collection = self._open_collection()
+        collection, client = self._open_collection()
         # 26.8M abstracts is far too much to hold in a {pmid: text} dict (~60 GB RAM). The text is
         # already in the chroma `documents` column, so serve it lazily + cached — only the docs a
         # question actually reads get materialized. (The systems only do keyed lookups on the doc
         # map; BioGen never iterates it, so the lazy mapping is a drop-in for the dict.)
         return BenchmarkResources(
             name=self.name,
-            # MergedCollection is a duck-typed Collection stand-in (query/get/count); cast so the
-            # fiction stays local here and consumers keep treating chroma_collection as a Collection.
-            chroma_collection=cast(Collection, collection),
+            chroma_collection=collection,
+            chroma_client=client,
             document_map=_ChromaDocMap(collection),
             answer_format_hint=self.answer_format_hint,
             compute_objective=self.compute_objective,
+            page_locator=None,
         )
 
     # ---- scoring + metrics ----------------------------------------------------

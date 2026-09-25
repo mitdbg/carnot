@@ -1,0 +1,772 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Datagen Trajectory Viewer</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:#0d0d0d; --bg1:#141414; --bg2:#1a1a1a; --bg3:#202020; --bg4:#262626;
+      --border:#252525; --border2:#2e2e2e; --border3:#3a3a3a;
+      --text:#e0e0e0; --text2:#aaaaaa; --text3:#666666;
+      --green:#33cc33; --yellow:#e6b800; --red:#ff4444; --blue:#3399ff; --purple:#cc66ff; --orange:#ff9933; --teal:#2fd4c0;
+      --green-bg:#001a00; --yellow-bg:#242200; --red-bg:#2a0000; --blue-bg:#001524; --purple-bg:#150022; --orange-bg:#241200;
+    }
+    html, body { background: var(--bg); color: var(--text); font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; font-size: 13px; line-height: 1.5; min-height: 100vh; }
+    #app { max-width: 1560px; margin: 0 auto; padding: 16px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    a { color: var(--blue); }
+
+    .header { display:flex; align-items:center; gap:12px; margin-bottom:14px; padding-bottom:12px; border-bottom:1px solid var(--border); }
+    .header-title { font-size:13px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color: var(--teal); }
+    .header-sub { font-size:11px; color: var(--text3); }
+    .header .spacer { flex:1; }
+    .btn { background:var(--bg3); border:1px solid var(--border2); color:var(--text2); font-size:11px; padding:3px 10px; border-radius:4px; cursor:pointer; }
+    .btn:hover { border-color:var(--text3); color:var(--text); }
+
+    .card { background: var(--bg2); border:1px solid var(--border); border-radius:6px; padding:14px 16px; margin-bottom:10px; }
+    .card-title { font-size:10px; font-weight:700; letter-spacing:1.2px; text-transform:uppercase; color: var(--text3); margin-bottom:10px; display:flex; gap:10px; align-items:center; }
+    .card-title .right { margin-left:auto; display:flex; gap:6px; }
+    details.card > summary { list-style:none; cursor:pointer; }
+    details.card > summary::-webkit-details-marker { display:none; }
+    details.card > summary .card-title { margin-bottom:0; }
+    details.card[open] > summary .card-title { margin-bottom:10px; }
+
+    .selectors { display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; min-width:0; }
+    body { overflow-x:hidden; }
+    .sel-group { display:flex; flex-direction:column; gap:4px; min-width:0; max-width:100%; flex:0 1 auto; }
+    .sel-group label { font-size:10px; font-weight:600; letter-spacing:0.8px; text-transform:uppercase; color: var(--text3); }
+    select { background: var(--bg1); color: var(--text); border:1px solid var(--border2); border-radius:4px; padding:6px 10px; font-size:12px; min-width:240px; cursor:pointer; appearance:none;
+      background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23666'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:right 8px center; padding-right:24px; max-width:min(720px, 100%); }
+    select:focus { outline:none; border-color: var(--teal); }
+    .toggle-row { display:flex; align-items:center; gap:6px; }
+    .toggle-row label { font-size:11px; color: var(--text3); cursor:pointer; user-select:none; }
+    input[type=checkbox] { accent-color: var(--teal); cursor:pointer; }
+
+    /* metadata pills */
+    .metabar { display:flex; gap:7px; flex-wrap:wrap; margin:6px 0 10px; }
+    .metapill { display:inline-flex; align-items:baseline; gap:7px; background:var(--bg3); border:1px solid var(--border2); border-radius:4px; padding:3px 10px; }
+    .metapill .mk { color:var(--text3); text-transform:uppercase; letter-spacing:0.7px; font-size:9px; font-weight:700; }
+    .metapill .mv { color:var(--text); font-family: ui-monospace, monospace; font-size:11px; }
+    .metapill.warn .mv { color:var(--yellow); }
+    .metapill.bad .mv { color:var(--red); }
+    .metapill.good .mv { color:var(--green); }
+
+    .badge { display:inline-block; font-size:10px; font-weight:700; letter-spacing:0.6px; padding:2px 7px; border-radius:3px; text-transform:uppercase; white-space:nowrap; }
+    .badge.ok   { background: var(--green-bg);  color: var(--green); }
+    .badge.bad  { background: var(--red-bg);    color: var(--red); }
+    .badge.warn { background: var(--yellow-bg); color: var(--yellow); }
+    .badge.info { background: var(--blue-bg);   color: var(--blue); }
+    .badge.dim  { background: var(--bg3);       color: var(--text2); }
+    .badge.step { background: var(--purple-bg); color: var(--purple); }
+
+    .q-text { font-size:14px; line-height:1.65; }
+    .kv { display:flex; gap:8px; margin-bottom:6px; font-size:12px; align-items:baseline; }
+    .kv .k { color: var(--text3); text-transform:uppercase; font-size:10px; letter-spacing:0.8px; min-width:110px; flex:0 0 auto; padding-top:2px; }
+    .kv .v { color: var(--text); white-space:pre-wrap; word-break:break-word; min-width:0; }
+    .ans-list { margin:0; padding-left:18px; }
+    .ans-list li { margin:1px 0; }
+
+    .chip { display:inline-block; font-family: ui-monospace, monospace; font-size:11px; padding:1px 8px; border-radius:10px; border:1px solid var(--border2); margin:2px 4px 2px 0; color: var(--text2); }
+    .chip-doc { color: var(--blue); border-color:#14406a; background: var(--blue-bg); cursor:pointer; }
+    .chip-doc:hover { filter:brightness(1.35); }
+    .chip-doc.chosen { color: var(--green); border-color:#1f5f1f; background: var(--green-bg); }
+    .chip-doc.seed { color: var(--yellow); border-color:#5a4a00; background: var(--yellow-bg); }
+    .chip-none { color: var(--text3); border-style:dashed; }
+
+    /* trajectory map */
+    .map { display:flex; flex-direction:column; gap:6px; }
+    .lane { display:flex; gap:12px; align-items:flex-start; padding:7px 0; border-top:1px dashed var(--border); }
+    .lane:first-child { border-top:none; }
+    .lane-label { flex:0 0 190px; font-size:11px; color:var(--text2); padding-top:4px; }
+    .lane-label b { color:var(--text); display:block; font-size:11px; letter-spacing:0.4px; }
+    .lane-label small { color:var(--text3); }
+    .lane-nodes { display:flex; flex-wrap:wrap; gap:6px; align-items:center; flex:1; }
+    .mnode { display:inline-flex; align-items:center; gap:7px; padding:4px 10px; border-radius:5px; border:1px solid var(--border3); background:var(--bg3); color:var(--text); font-size:11px; cursor:pointer; font-family:inherit; }
+    .mnode:hover { border-color:var(--text2); }
+    .mnode.ok { border-color:#1f5f1f; background:rgba(0,60,0,0.25); }
+    .mnode.bad { border-color:#6a1414; background:rgba(80,0,0,0.25); }
+    .mnode.seed { border-color:#5a4a00; background:rgba(60,50,0,0.25); cursor:default; }
+    .mnode .try { font-weight:700; color:var(--text2); }
+    .chk { font-family: ui-monospace, monospace; font-size:10px; padding:0 5px; border-radius:3px; }
+    .chk.ok { color:var(--green); background:var(--green-bg); }
+    .chk.bad { color:var(--red); background:var(--red-bg); }
+    .chk.warn { color:var(--yellow); background:var(--yellow-bg); }
+    .chk.dim { color:var(--text3); background:var(--bg1); }
+    .loop { color:var(--orange); font-size:11px; font-family: ui-monospace, monospace; white-space:nowrap; }
+    .arrow { color:var(--text3); font-size:14px; }
+    .legend { display:flex; gap:14px; flex-wrap:wrap; font-size:11px; color:var(--text3); margin-top:8px; align-items:center; }
+
+    /* attempt / stage cards */
+    .section-title { font-size:12px; font-weight:700; letter-spacing:1px; text-transform:uppercase; color:var(--teal); margin:18px 0 8px; display:flex; align-items:center; gap:10px; }
+    .section-title .sub { color:var(--text3); font-weight:400; text-transform:none; letter-spacing:0; font-size:12px; }
+    .node { border:1px solid var(--border); border-radius:6px; margin-bottom:8px; background: var(--bg2); overflow:hidden; }
+    .node.attempt { border-left:4px solid var(--border3); }
+    .node.attempt.ok  { border-left-color:var(--green); }
+    .node.attempt.bad { border-left-color:var(--red); }
+    .node.attempt.warn { border-left-color:var(--yellow); }
+    .node > summary { list-style:none; cursor:pointer; padding:8px 11px; display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+    .node > summary::-webkit-details-marker { display:none; }
+    .ti { display:inline-block; transition: transform 0.12s; color: var(--text3); font-size:11px; width:10px; }
+    details[open] > summary > .ti { transform: rotate(90deg); }
+    .node-summary { color: var(--text2); font-size:12px; flex:1 1 280px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .node-meta { color: var(--text3); font-size:11px; }
+    .node-body { padding:6px 11px 11px 11px; border-top:1px solid var(--border); }
+    .tmetrics { display:inline-flex; gap:7px; flex:0 0 auto; margin-left:auto; }
+    .tmetric { font-family: ui-monospace, monospace; font-size:11px; padding:2px 8px; border-radius:4px; border:1px solid var(--border2); background: var(--bg1); white-space:nowrap; display:inline-flex; align-items:baseline; gap:4px; }
+    .tmetric.tlat  { color: var(--blue); }
+    .tmetric.tcost { color: var(--green); }
+    .tmetric.tsteps { color: var(--purple); }
+    .tmetric .tm-k { color: var(--text3); font-size:9px; font-weight:700; letter-spacing:0.4px; }
+
+    .stage { border:1px solid var(--border2); border-radius:6px; background:var(--bg1); margin:8px 0; padding:9px 11px; }
+    .stage-head { display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin-bottom:7px; }
+    .stage-name { font-size:10px; font-weight:700; letter-spacing:1px; text-transform:uppercase; color:var(--purple); }
+    .stage.s2 .stage-name, .stage.s4 .stage-name { color:var(--blue); }
+    .stage.s3 .stage-name, .stage.s6 .stage-name { color:var(--purple); }
+    .stage.s5 .stage-name { color:var(--orange); }
+    .stage-head .right { margin-left:auto; display:flex; gap:6px; align-items:center; }
+    .outbox { border:1px solid var(--border2); border-left:3px solid var(--green); background:rgba(0,40,0,0.10); border-radius:4px; padding:8px 11px; margin:6px 0; }
+    .outbox.bad { border-left-color:var(--red); background:rgba(60,0,0,0.10); }
+    .outbox.neutral { border-left-color:var(--border3); background:var(--bg2); }
+    .outbox .ol { font-size:10px; letter-spacing:0.8px; text-transform:uppercase; color:var(--text3); font-weight:700; margin-bottom:4px; }
+    .twocol { display:grid; grid-template-columns: 1fr 1fr; gap:8px; }
+    @media (max-width: 900px) { .twocol { grid-template-columns: 1fr; } .lane { flex-direction:column; } .lane-label { flex-basis:auto; } }
+    .footer-row { display:flex; gap:10px; align-items:center; margin-top:8px; font-size:12px; color:var(--text2); }
+    .footer-row .loop { font-size:12px; }
+    .warnbox { border:1px solid #3a2e00; border-left:3px solid var(--yellow); background:#171200; padding:7px 11px; margin:6px 0; border-radius:4px; font-size:12px; color:var(--text); }
+    .warnbox b { color:var(--yellow); }
+    .errbox { border:1px solid #4a0f0f; border-left:3px solid var(--red); background:#1a0000; padding:7px 11px; margin:6px 0; border-radius:4px; font-size:12px; font-family: ui-monospace, monospace; white-space:pre-wrap; }
+
+    /* neighbours table */
+    table.tbl { border-collapse:collapse; width:100%; font-size:12px; }
+    table.tbl th { text-align:left; font-size:10px; text-transform:uppercase; letter-spacing:0.7px; color:var(--text3); padding:4px 8px; border-bottom:1px solid var(--border2); white-space:nowrap; }
+    table.tbl td { padding:5px 8px; border-bottom:1px solid var(--border); vertical-align:top; color:var(--text2); }
+    table.tbl tr.hit td { background:rgba(80,0,0,0.25); color:var(--text); }
+    table.tbl tr.clickable { cursor:pointer; }
+    table.tbl tr.clickable:hover td { background:var(--bg3); }
+    table.tbl tr.active td { background:rgba(47,212,192,0.08); }
+    table.tbl td.num, table.tbl th.num { text-align:right; font-family: ui-monospace, monospace; white-space:nowrap; }
+    .tblwrap { overflow-x:auto; }
+
+    /* messages (agent events) */
+    .msg { border-left:4px solid var(--text3); border-radius:0 4px 4px 0; padding:7px 10px; margin:6px 0; background: var(--bg1); }
+    .msg-bar { display:flex; align-items:center; gap:8px; margin-bottom:4px; font-size:10px; font-weight:700; letter-spacing:0.8px; }
+    .msg-bar .meta { margin-left:auto; color: var(--text3); font-weight:500; font-size:10px; }
+    .msg-text { font-family: ui-monospace, monospace; font-size:12px; line-height:1.55; white-space:pre-wrap; word-break:break-word; color: var(--text); }
+    .msg.compact { border-left-width:2px; padding:3px 10px; background:transparent; margin:2px 0; }
+    .msg.compact .msg-line { font-family: ui-monospace, monospace; font-size:11px; color: var(--text3); white-space:pre-wrap; word-break:break-word; }
+    .expand-btn { margin-top:5px; background:var(--bg3); border:1px solid var(--border2); color:var(--blue); font-size:11px; padding:2px 9px; border-radius:4px; cursor:pointer; }
+    .expand-btn:hover { border-color:var(--blue); }
+    .turn { border:1px solid var(--border2); border-radius:5px; margin:5px 0; background:var(--bg2); }
+    .turn > summary { list-style:none; cursor:pointer; padding:6px 10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:12px; }
+    .turn > summary::-webkit-details-marker { display:none; }
+    .turn-body { padding:4px 10px 8px; border-top:1px solid var(--border); }
+    .op-badge { font-size:10px; font-weight:700; letter-spacing:0.6px; padding:2px 7px; border-radius:3px; text-transform:uppercase; }
+    .rollout { margin-top:4px; }
+    .rollout > summary { list-style:none; cursor:pointer; font-size:11px; color:var(--text2); padding:4px 0; }
+    .rollout > summary::-webkit-details-marker { display:none; }
+    .rollout > summary:hover { color:var(--text); }
+    .hint { color: var(--text3); font-size:12px; padding:8px 2px; }
+    .empty { color: var(--text3); font-style:italic; font-size:11px; }
+
+    /* doc drawer */
+    .drawer { position:fixed; top:0; right:0; height:100vh; width:min(720px, 92vw); background:var(--bg1); border-left:1px solid var(--border3); box-shadow:-8px 0 30px rgba(0,0,0,0.6); z-index:50; display:flex; flex-direction:column; transform:translateX(102%); transition:transform 0.15s; }
+    .drawer.open { transform:translateX(0); }
+    .drawer.wide { width:min(1400px, 96vw); }
+    .drawer-head { display:flex; flex-direction:column; gap:6px; padding:8px 14px; border-bottom:1px solid var(--border2); }
+    .drawer-head .row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .drawer-head .t { font-family: ui-monospace, monospace; color:var(--blue); font-size:12px; }
+    .drawer-head .src { font-family: ui-monospace, monospace; color:var(--text3); font-size:11px; }
+    .drawer-tools { display:inline-flex; align-items:center; gap:6px; }
+    .drawer-tools[hidden] { display:none; }
+    .seg { display:inline-flex; }
+    .seg .btn { border-radius:0; }
+    .seg .btn:first-child { border-radius:4px 0 0 4px; }
+    .seg .btn:last-child { border-radius:0 4px 4px 0; border-left:none; }
+    .seg .btn.on { background:var(--blue-bg); color:var(--blue); border-color:var(--blue); }
+    .zv { font-family: ui-monospace, monospace; font-size:11px; color:var(--text2); min-width:44px; text-align:center; }
+    a.btn { text-decoration:none; }
+    .drawer-body { flex:1; overflow:auto; padding:12px 14px; font-family: ui-monospace, monospace; font-size:11.5px; line-height:1.5; white-space:pre-wrap; word-break:break-word; color:var(--text2); }
+    .drawer-pdf { flex:1; overflow:auto; background:#2b2b2b; cursor:grab; position:relative; }
+    .drawer-pdf.dragging { cursor:grabbing; user-select:none; }
+    .drawer-pdf img { display:block; margin:12px auto; box-shadow:0 2px 14px rgba(0,0,0,0.7); background:#fff; }
+    .drawer-pdf .pdf-msg { position:absolute; top:10px; left:50%; transform:translateX(-50%); background:var(--bg3); border:1px solid var(--border3); color:var(--text2); font-size:11px; padding:3px 10px; border-radius:4px; pointer-events:none; }
+    .drawer-pdf .pdf-msg.bad { color:var(--red); }
+    [hidden] { display:none !important; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div class="header">
+    <span class="header-title">Datagen Trajectory Viewer</span>
+    <span class="header-sub" id="runsub"></span>
+    <span class="spacer"></span>
+    <button class="btn" onclick="VW.expandAll(true)">expand attempts</button>
+    <button class="btn" onclick="VW.expandAll(false)">collapse attempts</button>
+  </div>
+  <div class="card">
+    <div class="selectors">
+      <div class="sel-group"><label>Run</label><select id="run-sel"></select></div>
+      <div class="sel-group"><label>Seed question</label><select id="q-sel"></select></div>
+      <div class="toggle-row" style="margin-left:auto"><input type="checkbox" id="show-system"><label for="show-system">system prompts</label></div>
+      <div class="toggle-row"><input type="checkbox" id="show-calls"><label for="show-calls">LLM call lines</label></div>
+      <div class="toggle-row"><input type="checkbox" id="show-rejected" checked><label for="show-rejected">open rejected attempts</label></div>
+    </div>
+  </div>
+  <details class="card" id="overview"><summary><div class="card-title">Run overview <span class="right" id="ov-sub"></span></div></summary><div id="ov-body"></div></details>
+  <div id="content"></div>
+</div>
+<div id="drawer" class="drawer">
+  <div class="drawer-head">
+    <div class="row">
+      <span class="t" id="drawer-title"></span><span class="src" id="drawer-src"></span>
+      <span style="flex:1"></span>
+      <button class="btn" onclick="VW.docWide()" title="toggle drawer width">⇔</button>
+      <button class="btn" onclick="VW.closeDoc()">close ✕</button>
+    </div>
+    <div class="row drawer-tools" id="drawer-tools" hidden>
+      <span class="seg"><button class="btn" id="dm-pdf" onclick="VW.docMode('pdf')" title="rendered source PDF page">pdf</button><button class="btn" id="dm-text" onclick="VW.docMode('text')" title="extracted text">text</button></span>
+      <span class="drawer-tools" id="drawer-zoom">
+        <button class="btn" onclick="VW.docZoom(1/1.25)" title="zoom out  (−)">−</button><span class="zv" id="zoom-val">100%</span><button class="btn" onclick="VW.docZoom(1.25)" title="zoom in  (+)">+</button>
+        <button class="btn" onclick="VW.docZoom('fit')" title="fit page width  (0)">fit</button>
+        <span class="src">ctrl/⌘+wheel or pinch to zoom · drag to pan</span>
+        <span style="flex:1"></span>
+        <a class="btn" id="drawer-pdf-link" href="#" target="_blank" rel="noopener" title="open the whole bulletin PDF in a new tab at this page">open pdf ↗</a>
+      </span>
+    </div>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+  <div class="drawer-pdf" id="drawer-pdf" hidden><img id="drawer-img" alt="" draggable="false"><span class="pdf-msg" id="pdf-msg" hidden></span></div>
+</div>
+
+<script>
+"use strict";
+
+// ── constants ───────────────────────────────────────────────────────────────
+const KIND = {
+  system:      { color:"#888888", bg:"var(--bg2)",       label:"SYSTEM" },
+  user:        { color:"#e6b800", bg:"var(--yellow-bg)", label:"USER" },
+  assistant:   { color:"#33cc33", bg:"var(--green-bg)",  label:"ASSISTANT" },
+  observation: { color:"#3399ff", bg:"var(--blue-bg)",   label:"OBSERVATION" },
+  error:       { color:"#ff4444", bg:"var(--red-bg)",    label:"ERROR" },
+  call:        { color:"#666666", bg:"transparent",      label:"LLM CALL" },
+  note:        { color:"#888888", bg:"transparent",      label:"NOTE" },
+  lifecycle:   { color:"#cc66ff", bg:"var(--purple-bg)", label:"LIFECYCLE" },
+};
+const TRUNC = { user: 2500, observation: 5000, system: 60000, default: 40000 };
+const TOOL_COLOR = { search_corpus:"#3399ff", grep_corpus:"#2fd4c0", read_document:"#e6b800", view_figure:"#ff9933", final:"#33cc33" };
+const STAGE = {
+  seed:   { n:"①", name:"Seed question" },
+  inq:    { n:"②", name:"Line of inquiry rollout" },
+  inqdup: { n:"③", name:"Unique determination (line of inquiry)" },
+  fu:     { n:"④", name:"Follow-up rollout (docs sampled + question generated)" },
+  solv:   { n:"⑤", name:"Solvable determination" },
+  qadup:  { n:"⑥", name:"Unique determination (QA pair)" },
+};
+
+const S = { runs:[], run:null, overview:null, verdicts:null, qid:null, tr:null, expanded:new Set() };
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;" }[c]));
+const enc = encodeURIComponent;
+async function getJSON(url){ const r = await fetch(url); const j = await r.json(); if(!r.ok) throw new Error(j.error || (url+" → "+r.status)); return j; }
+const fsec = (s) => (s==null ? "?" : (+s).toFixed(1)+"s");
+const fusd = (x) => (x==null ? "?" : "$"+(+x).toFixed(4));
+const tok = (n) => Math.round(n/4).toLocaleString();
+const showSystem = () => document.getElementById("show-system").checked;
+const showCalls  = () => document.getElementById("show-calls").checked;
+const openRejected = () => document.getElementById("show-rejected").checked;
+const $ = (id) => document.getElementById(id);
+const evText = (e) => { const d = e.data || {}; if(typeof d.text === "string") return d.text; if(Array.isArray(d.blocks)) return d.blocks.map(b => b.text || "").join(""); return e.message || ""; };
+
+function answerHtml(a){
+  if(a == null) return `<span class="empty">none</span>`;
+  if(Array.isArray(a)) return a.length ? `<ul class="ans-list">${a.map(x => `<li>${esc(typeof x === "string" ? x : JSON.stringify(x))}</li>`).join("")}</ul>` : `<span class="empty">[]</span>`;
+  if(typeof a === "object") return `<span class="mono">${esc(JSON.stringify(a))}</span>`;
+  return esc(a);
+}
+function docChips(ids, cls="", chosen=new Set(), max=80){
+  if(!ids || !ids.length) return `<span class="chip chip-none">no docs</span>`;
+  const shown = ids.slice(0, max).map(d => `<span class="chip chip-doc ${cls} ${chosen.has(d) ? "chosen" : ""}" onclick="VW.openDoc('${esc(d)}')" title="open document">${esc(d)}</span>`).join("");
+  return shown + (ids.length > max ? `<span class="chip chip-none">+${ids.length-max} more</span>` : "");
+}
+function metric(cls, k, v){ return `<span class="tmetric ${cls}"><span class="tm-k">${k}</span>${v}</span>`; }
+function nodeMetrics(node){
+  if(!node || !node.stats) return "";
+  const st = node.stats, seg = node.segment;
+  const steps = seg ? seg.n_steps : st.n_steps;
+  return `<span class="tmetrics">${metric("tsteps","steps",steps ?? "?")}${metric("tlat","wall",fsec(st.wall_latency_s))}${metric("tcost","$",fusd(st.cost_usd))}</span>`;
+}
+function sumMetrics(nodes){
+  const ns = nodes.filter(Boolean);
+  if(!ns.length) return "";
+  const cost = ns.reduce((a,n)=>a+(+n.stats.cost_usd||0),0), wall = ns.reduce((a,n)=>a+(+n.stats.wall_latency_s||0),0);
+  return `<span class="tmetrics">${metric("tlat","wall",fsec(wall))}${metric("tcost","$",fusd(cost))}</span>`;
+}
+function kv(k, vHtml){ return `<div class="kv"><span class="k">${esc(k)}</span><span class="v">${vHtml}</span></div>`; }
+
+window.VW = {
+  toggleExpand(key){ if(S.expanded.has(key)) S.expanded.delete(key); else S.expanded.add(key); draw(); },
+  goto(id){ const el = $(id); if(!el) return; el.open = true; el.scrollIntoView({ behavior:"smooth", block:"start" }); },
+  expandAll(open){ document.querySelectorAll("details.attempt").forEach(d => { d.open = open; }); },
+  openDoc(docId){ DOC.open(docId); },
+  closeDoc(){ $("drawer").classList.remove("open"); },
+  docMode(m){ DOC.setMode(m); },
+  docZoom(f){ DOC.zoom(f); },
+  docWide(){ $("drawer").classList.toggle("wide"); DOC.layout(); },
+  loadQuestion(qid){ $("q-sel").value = qid; loadQuestion(qid); },
+};
+document.addEventListener("keydown", e => {
+  if(e.key === "Escape") return VW.closeDoc();
+  if(!$("drawer").classList.contains("open") || DOC.mode !== "pdf" || !DOC.pdf) return;
+  if(e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+  if(e.key === "+" || e.key === "=") DOC.zoom(1.25); else if(e.key === "-") DOC.zoom(1/1.25); else if(e.key === "0") DOC.zoom("fit");
+});
+
+// ── document drawer (text, or the rendered source PDF page when the run's corpus has one) ──────
+// Zoom is relative to "fit width" (100% = page width fills the drawer). The PNG is re-requested at a
+// higher dpi as you zoom in so table details stay crisp; ctrl/⌘+wheel (or pinch) zooms around the
+// cursor, plain wheel scrolls, and dragging pans.
+const DOC = {
+  docId:null, text:null, pdf:null, mode: localStorage.getItem("docMode") || "pdf", zoomv:1, dpi:0, inchW:null, seq:0,
+  DPI_TIERS: [170, 300, 450],
+  async open(docId){
+    this.docId = docId; this.text = null; this.pdf = null; this.zoomv = 1; this.dpi = 0; this.inchW = null; this.seq++;
+    $("drawer-title").textContent = docId; $("drawer-src").textContent = ""; $("drawer-body").textContent = "loading …";
+    $("drawer-tools").hidden = true; $("drawer-img").removeAttribute("src"); this.msg(null);
+    $("drawer").classList.add("open");
+    this.render();
+    try {
+      const j = await getJSON(`/api/doc?run=${enc(S.run)}&doc_id=${enc(docId)}`);
+      if(this.docId !== docId) return;
+      this.text = j.text; this.pdf = j.pdf || null;
+      $("drawer-tools").hidden = !this.pdf;
+      if(this.pdf){
+        $("drawer-src").textContent = `${this.pdf.file} · page ${this.pdf.page}`;
+        $("drawer-pdf-link").href = `/api/doc_pdf?run=${enc(S.run)}&doc_id=${enc(docId)}#page=${this.pdf.page}`;
+      }
+    } catch(e){ this.text = String(e.message || e); }
+    this.render();
+  },
+  setMode(m){ this.mode = m; localStorage.setItem("docMode", m); this.render(); },
+  render(){
+    const pdfMode = this.mode === "pdf" && !!this.pdf;
+    $("dm-pdf").classList.toggle("on", pdfMode); $("dm-text").classList.toggle("on", !pdfMode);
+    $("drawer-zoom").hidden = !pdfMode;
+    $("drawer-body").hidden = pdfMode; $("drawer-pdf").hidden = !pdfMode;
+    if(!pdfMode){ $("drawer-body").textContent = this.text ?? (this.pdf ? "(no extracted text on disk for this document)" : "loading …"); return; }
+    this.layout();
+  },
+  fitW(){ const c = $("drawer-pdf"); return Math.max(100, c.clientWidth - 24); },
+  layout(){
+    if(this.mode !== "pdf" || !this.pdf) return;
+    const img = $("drawer-img"), w = this.fitW() * this.zoomv;
+    img.style.width = w + "px";
+    $("zoom-val").textContent = Math.round(this.zoomv * 100) + "%";
+    // pick the dpi tier that gives at least the on-screen pixel width (ignore until we know the page size)
+    const need = w * (window.devicePixelRatio || 1);
+    let dpi = this.DPI_TIERS[0];
+    if(this.inchW) for(const t of this.DPI_TIERS){ dpi = t; if(t * this.inchW >= need) break; }
+    if(dpi !== this.dpi) this.fetchPng(dpi);
+  },
+  fetchPng(dpi){
+    this.dpi = dpi;
+    const seq = ++this.seq, url = `/api/doc_page.png?run=${enc(S.run)}&doc_id=${enc(this.docId)}&dpi=${dpi}`;
+    const img = $("drawer-img"), pre = new Image();
+    if(!img.getAttribute("src")) this.msg(`rendering page ${this.pdf.page} …`); else this.msg(`re-rendering at ${dpi} dpi …`);
+    pre.onload = () => {
+      if(seq !== this.seq) return;
+      this.inchW = pre.naturalWidth / dpi; img.src = url; this.msg(null);
+      this.layout();  // the tier choice may change now that the page size is known
+    };
+    pre.onerror = async () => {
+      if(seq !== this.seq) return;
+      let detail = ""; try { const r = await fetch(url); const j = await r.json(); detail = j.error || ""; } catch(_){}
+      this.msg(`could not render page: ${detail || "server error"}`, true);
+    };
+    pre.src = url;
+  },
+  zoom(f, cx, cy){
+    if(this.mode !== "pdf" || !this.pdf) return;
+    const c = $("drawer-pdf"), rect = c.getBoundingClientRect();
+    const old = this.zoomv;
+    this.zoomv = f === "fit" ? 1 : Math.min(8, Math.max(0.25, this.zoomv * f));
+    // keep the point under the cursor (or the viewport centre) fixed
+    const ax = cx == null ? rect.width / 2 : cx - rect.left, ay = cy == null ? rect.height / 2 : cy - rect.top;
+    const k = this.zoomv / old, sl = c.scrollLeft, st = c.scrollTop;
+    this.layout();
+    c.scrollLeft = (sl + ax) * k - ax; c.scrollTop = (st + ay) * k - ay;
+  },
+  msg(t, bad=false){ const m = $("pdf-msg"); m.hidden = !t; m.textContent = t || ""; m.classList.toggle("bad", bad); },
+  init(){
+    const c = $("drawer-pdf");
+    c.addEventListener("wheel", e => {
+      if(!(e.ctrlKey || e.metaKey)) return;  // plain wheel scrolls; ctrl/⌘ + wheel and trackpad pinch zoom
+      e.preventDefault();
+      this.zoom(Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0025)), e.clientX, e.clientY);
+    }, { passive:false });
+    let drag = null;
+    c.addEventListener("mousedown", e => { if(e.button !== 0) return; drag = { x:e.clientX, y:e.clientY, sl:c.scrollLeft, st:c.scrollTop }; c.classList.add("dragging"); e.preventDefault(); });
+    window.addEventListener("mousemove", e => { if(!drag) return; c.scrollLeft = drag.sl - (e.clientX - drag.x); c.scrollTop = drag.st - (e.clientY - drag.y); });
+    window.addEventListener("mouseup", () => { drag = null; c.classList.remove("dragging"); });
+    window.addEventListener("resize", () => this.layout());
+  },
+};
+DOC.init();
+
+// ── boot / navigation ───────────────────────────────────────────────────────
+function hashState(){ const h = new URLSearchParams(location.hash.replace(/^#/, "")); return { run:h.get("run"), qid:h.get("qid") }; }
+function setHash(){ const h = new URLSearchParams(); if(S.run) h.set("run", S.run); if(S.qid) h.set("qid", S.qid); history.replaceState(null, "", "#"+h.toString()); }
+
+async function boot(){
+  const { runs } = await getJSON("/api/runs");
+  S.runs = runs || [];
+  $("runsub").textContent = `${S.runs.length} run(s)`;
+  $("run-sel").innerHTML = S.runs.map(r => `<option value="${esc(r.run)}">${esc(r.run)} — ${r.n_records} q · ${r.n_failed} failed · k=${r.k ?? "?"} · ${esc(r.model_id ?? "")}</option>`).join("");
+  $("run-sel").onchange = () => loadRun($("run-sel").value, null);
+  $("q-sel").onchange = () => loadQuestion($("q-sel").value);
+  for(const id of ["show-system","show-calls","show-rejected"]) $(id).onchange = draw;
+  if(!S.runs.length){ $("content").innerHTML = `<div class="hint">No runs found under the runs root.</div>`; return; }
+  const h = hashState();
+  const run = S.runs.some(r => r.run === h.run) ? h.run : S.runs[0].run;
+  $("run-sel").value = run;
+  await loadRun(run, h.qid);
+}
+
+async function loadRun(run, wantQid){
+  S.run = run; S.verdicts = null;
+  $("content").innerHTML = `<div class="hint">Loading run …</div>`;
+  S.overview = await getJSON(`/api/run?run=${enc(run)}`);
+  const qs = S.overview.questions;
+  $("q-sel").innerHTML = qs.map(q => {
+    const mark = q.status === "done" ? "✓" : (q.status === "failed" ? "✗" : "◐");
+    const tries = q.followup_tries ? ` [${q.n_pairs}p/${q.followup_tries}t]` : "";
+    return `<option value="${esc(q.qid)}">${mark} ${esc(q.qid)}${tries} — ${esc((q.seed_question||"").slice(0,100))}</option>`;
+  }).join("");
+  drawOverview();
+  const qid = qs.some(q => q.qid === wantQid) ? wantQid : (qs[0] && qs[0].qid);
+  if(qid){ $("q-sel").value = qid; await loadQuestion(qid); }
+  else $("content").innerHTML = `<div class="hint">No questions in this run.</div>`;
+  // judge verdicts need every trace parsed — fetch after the page is usable
+  getJSON(`/api/run_verdicts?run=${enc(run)}`).then(j => { if(S.run === run){ S.verdicts = j.verdicts; drawOverview(); } }).catch(() => {});
+}
+
+async function loadQuestion(qid){
+  S.qid = qid; S.expanded = new Set(); setHash();
+  $("content").innerHTML = `<div class="hint">Loading ${esc(qid)} …</div>`;
+  try { S.tr = await getJSON(`/api/question?run=${enc(S.run)}&qid=${enc(qid)}`); }
+  catch(e){ $("content").innerHTML = `<div class="errbox">${esc(e.message || e)}</div>`; return; }
+  draw();
+  drawOverview();
+  window.scrollTo({ top: 0 });
+}
+
+// ── run overview ────────────────────────────────────────────────────────────
+function drawOverview(){
+  const ov = S.overview; if(!ov) return;
+  const f = ov.funnel, cfg = ov.run_config || {};
+  const V = S.verdicts || {};
+  const vSum = (k) => S.verdicts ? Object.values(V).reduce((a,x)=>a+(x[k]||0),0) : null;
+  $("ov-sub").innerHTML = `<span class="badge ok">${f.n_done} done</span>${f.n_failed?`<span class="badge bad">${f.n_failed} failed</span>`:""}${f.n_in_progress?`<span class="badge warn">${f.n_in_progress} no record</span>`:""}<span class="badge dim">${f.n_qa_pairs} qa pairs</span>`;
+  const pills = [
+    ["model", cfg.model_id ?? "?"], ["k", cfg.k ?? "?"], ["benchmark", `${cfg.benchmark ?? "?"}/${cfg.split ?? "?"}`],
+    ["seed questions", f.n_questions], ["inquiry tries", f.inquiry_tries], ["follow-up tries", f.followup_tries],
+    ["unsolvable", f.n_unsolvable, f.n_unsolvable ? "warn" : ""], ["dup (recorded)", f.n_dup_inquiry + f.n_dup_qa],
+    ["judge flagged dup", S.verdicts ? `${vSum("inquiry_verdict_dup")} inq · ${vSum("qa_verdict_dup")} qa` : "…", S.verdicts && (vSum("inquiry_verdict_ignored")+vSum("qa_verdict_ignored"))>0 ? "warn" : ""],
+    ["accepted pairs", f.n_qa_pairs, "good"], ["cost", fusd(f.cost_usd)],
+  ];
+  const rows = ov.questions.map(q => {
+    const v = V[q.qid];
+    const vcell = v ? `${v.inquiry_verdict_dup}/${v.qa_verdict_dup}${(v.inquiry_verdict_ignored+v.qa_verdict_ignored)?" ⚠":""}` : (S.verdicts ? "–" : "…");
+    const st = (q.status === "done" ? `<span class="badge ok">done</span>` : (q.status === "failed" ? `<span class="badge bad" title="${esc(q.error)}">failed</span>` : `<span class="badge warn">no record</span>`)) + (q.inferred ? ` <span class="badge dim" title="no stats rows: counts inferred from the trace">inferred</span>` : "");
+    return `<tr class="clickable ${q.qid===S.qid?"active":""}" onclick="VW.loadQuestion('${esc(q.qid)}')">
+      <td class="mono">${esc(q.qid)}</td><td>${st}</td><td class="num">${q.n_pairs}</td><td class="num">${q.inquiry_tries}</td><td class="num">${q.followup_tries}</td>
+      <td class="num">${q.n_unsolvable}</td><td class="num">${q.n_dup_inquiry + q.n_dup_qa}</td><td class="num" title="judge said duplicate: inquiry / qa (⚠ = verdict not acted on)">${vcell}</td>
+      <td class="num">${fusd(q.cost_usd)}</td><td class="num">${fsec(q.wall_latency_s)}</td><td>${esc((q.seed_question||"").slice(0,110))}</td></tr>`;
+  }).join("");
+  $("ov-body").innerHTML = `
+    <div class="metabar">${pills.map(([k,v,c]) => `<span class="metapill ${c||""}"><span class="mk">${esc(k)}</span><span class="mv">${esc(v)}</span></span>`).join("")}</div>
+    <div class="hint" style="padding-top:0">Funnel: ${f.n_questions} seeds → ${f.inquiry_tries} inquiry rollouts → ${f.followup_tries} follow-up rollouts → ${f.n_unsolvable} rejected as unsolvable, ${f.n_dup_inquiry + f.n_dup_qa} rejected as duplicate (recorded flag) → ${f.n_qa_pairs} accepted qa pairs.
+      "judge flagged dup" counts attempts where the duplicate judge returned an ID; ⚠ marks verdicts the generator did not act on (it only treats <code>duplicate is True</code> as a duplicate, so an ID string never triggers a retry).</div>
+    <div class="tblwrap"><table class="tbl"><thead><tr><th>qid</th><th>status</th><th class="num">pairs</th><th class="num">inq tries</th><th class="num">fu tries</th><th class="num">unsolvable</th><th class="num">dup flag</th><th class="num">judge dup</th><th class="num">cost</th><th class="num">wall</th><th>seed question</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+// ── question view ───────────────────────────────────────────────────────────
+function draw(){
+  const tr = S.tr; if(!tr) return;
+  const parts = [seedCard(tr), mapCard(tr), inquirySection(tr)];
+  for(const f of tr.followups) parts.push(followupSection(tr, f));
+  parts.push(pairsCard(tr), extrasCard(tr));
+  $("content").innerHTML = parts.join("");
+}
+
+function seedCard(tr){
+  const rec = tr.record, t = tr.totals;
+  const status = !rec ? `<span class="badge warn">no record (in progress?)</span>` : (rec.failed ? `<span class="badge bad">failed</span>` : `<span class="badge ok">done · ${Math.max(0, rec.qa_pairs.length-1)} pairs</span>`);
+  const inqTries = tr.inquiry_attempts.length, fuTries = tr.followups.reduce((a,f)=>a+f.attempts.length,0);
+  const pills = [["cost", fusd(t.cost_usd)], ["wall (agents)", fsec(t.wall_latency_s)], ["wall (question)", rec ? fsec(rec.wall_latency_s) : "?"], ["agent runs", t.n_generations], ["inquiry tries", inqTries], ["follow-up tries", fuTries], ["errors", t.n_errors, t.n_errors ? "bad" : ""], ["events", tr.n_events]];
+  return `<div class="card">
+    <div class="card-title">${STAGE.seed.n} ${STAGE.seed.name} <span class="mono" style="color:var(--text)">${esc(tr.qid)}</span> ${status}</div>
+    <div class="q-text">${esc(tr.seed.question || "(seed question unknown)")}</div>
+    <div class="metabar">${pills.map(([k,v,c]) => `<span class="metapill ${c||""}"><span class="mk">${esc(k)}</span><span class="mv">${esc(v)}</span></span>`).join("")}</div>
+    ${kv("seed answer", answerHtml(tr.seed.answer))}
+    ${kv("seed docs", docChips(tr.seed.doc_ids, "seed"))}
+    ${tr.line_of_inquiry ? kv("line of inquiry", `<span style="color:var(--text2)">${esc(tr.line_of_inquiry)}</span>`) : kv("line of inquiry", `<span class="empty">none accepted</span>`)}
+    ${rec && rec.error ? `<div class="errbox">${esc(rec.error)}</div>` : ""}
+    ${tr.inferred ? `<div class="warnbox"><b>Structure inferred from the trace.</b> This question has no generation_stats rows yet (they are written when the whole question finishes), so attempts, solvable and unique flags were re-derived from the agent outputs using the generator's own rules.</div>` : ""}
+  </div>`;
+}
+
+// ── trajectory map: one lane per stage, one node per attempt, ↺ between retries
+function mapCard(tr){
+  const lanes = [];
+  lanes.push(`<div class="lane"><div class="lane-label"><b>${STAGE.seed.n} Seed</b><small>${esc(tr.qid)}</small></div><div class="lane-nodes"><span class="mnode seed">${esc((tr.seed.question||"").slice(0,90))}${(tr.seed.question||"").length>90?"…":""}</span><span class="arrow">→</span><span class="chk dim">${(tr.seed.doc_ids||[]).length} seed doc(s)</span></div></div>`);
+
+  const inqNodes = [];
+  tr.inquiry_attempts.forEach((a, i) => {
+    if(i > 0) inqNodes.push(`<span class="loop">↺ not unique</span>`);
+    const cls = a.accepted ? "ok" : "bad";
+    const checks = [
+      a.gen ? `<span class="chk ${a.error?"bad":"ok"}">gen ${a.gen.segment ? a.gen.segment.n_steps+" steps" : ""}</span>` : `<span class="chk dim">gen ?</span>`,
+      a.unique == null ? `<span class="chk dim">unique ?</span>` : `<span class="chk ${a.unique?"ok":"bad"}">unique ${a.unique?"✓":"✗"}</span>`,
+      a.verdict_ignored ? `<span class="chk warn" title="judge returned a duplicate ID but the recorded flag is unique">⚠ judge: dup of ${esc(a.dedup.verdict.duplicate_of)}</span>` : "",
+    ].join("");
+    inqNodes.push(`<button class="mnode ${cls}" onclick="VW.goto('att-inq-${a.attempt}')"><span class="try">try ${a.attempt}</span>${checks}</button>`);
+  });
+  const last = tr.inquiry_attempts[tr.inquiry_attempts.length-1];
+  inqNodes.push(last && last.accepted ? `<span class="arrow">→</span><span class="chk ok">accepted · ${(last.doc_ids||[]).length} docs</span>` : `<span class="chk bad">${tr.inquiry_attempts.length ? "exhausted" : "not run"}</span>`);
+  lanes.push(`<div class="lane"><div class="lane-label"><b>${STAGE.inq.n}→${STAGE.inqdup.n} Line of inquiry</b><small>generate → unique?</small></div><div class="lane-nodes">${inqNodes.join("")}</div></div>`);
+
+  for(const f of tr.followups){
+    const nodes = [];
+    f.attempts.forEach((a, i) => {
+      if(i > 0) nodes.push(`<span class="loop">↺ ${esc(f.attempts[i-1].reject_reason || "retry")}</span>`);
+      const cls = a.accepted ? "ok" : "bad";
+      const solv = a.solvable == null ? `<span class="chk dim">solv ?</span>` : `<span class="chk ${a.solvable?"ok":"bad"}" title="${a.exact_match?"exact answer match":(a.equivalence_verdict?"equivalence judge: "+a.equivalence_verdict:"")}">solv ${a.solvable?"✓":"✗"}${a.exact_match?" =":""}</span>`;
+      const uniq = a.dedup_skipped ? `<span class="chk dim">uniq —</span>` : (a.unique == null ? `<span class="chk dim">uniq ?</span>` : `<span class="chk ${a.unique?"ok":"bad"}">uniq ${a.unique?"✓":"✗"}</span>`);
+      const warn = a.verdict_ignored ? `<span class="chk warn" title="judge returned a duplicate ID but the recorded flag is unique">⚠ dup of ${esc(a.dedup.verdict.duplicate_of)}</span>` : "";
+      const docs = `<span class="chk dim" title="doc_ids chosen / target">${(a.doc_ids||[]).length}/${a.n_docs_target ?? f.n_docs_target ?? "?"} docs</span>`;
+      const nugs = `<span class="chk dim" title="answer nuggets emitted / target">${nuggetCount(a.answer)}/${a.n_nuggets_target ?? f.n_nuggets_target ?? "?"} nug</span>`;
+      nodes.push(`<button class="mnode ${cls}" onclick="VW.goto('att-fu-${f.idx}-${a.attempt}')"><span class="try">try ${a.attempt}</span>${docs}${nugs}${solv}${uniq}${warn}</button>`);
+    });
+    const lastA = f.attempts[f.attempts.length-1];
+    nodes.push(lastA && lastA.accepted ? `<span class="arrow">→</span><span class="chk ok">accepted as pair #${f.idx}</span>` : `<span class="arrow">→</span><span class="chk bad">${lastA ? "exhausted after "+f.attempts.length+" tries" : "not run"}</span>`);
+    lanes.push(`<div class="lane"><div class="lane-label"><b>${STAGE.fu.n}→${STAGE.solv.n}→${STAGE.qadup.n} Follow-up #${f.idx}</b><small>target ${f.n_docs_target ?? "?"} doc(s) · ${f.n_nuggets_target ?? "?"} nugget(s) · generate → solvable? → unique?</small></div><div class="lane-nodes">${nodes.join("")}</div></div>`);
+  }
+  if(!tr.followups.length) lanes.push(`<div class="lane"><div class="lane-label"><b>④→⑤→⑥ Follow-ups</b></div><div class="lane-nodes"><span class="chk dim">none started</span></div></div>`);
+  return `<div class="card"><div class="card-title">Trajectory map <span class="sub" style="text-transform:none;letter-spacing:0;font-weight:400">click a node to jump to that attempt</span></div>
+    <div class="map">${lanes.join("")}</div>
+    <div class="legend"><span><span class="chk ok">✓</span> passed check</span><span><span class="chk bad">✗</span> failed check</span><span><span class="chk dim">—</span> skipped (dedup only runs when solvable)</span><span><span class="chk warn">⚠</span> judge flagged a duplicate ID that the generator ignored</span><span><span class="loop">↺</span> retry loop</span><span><span class="chk dim">=</span> exact answer match (no equivalence judge)</span></div>
+  </div>`;
+}
+
+// ── stage ②/③ ───────────────────────────────────────────────────────────────
+function inquirySection(tr){
+  if(!tr.inquiry_attempts.length) return `<div class="section-title">${STAGE.inq.n}/${STAGE.inqdup.n} Line of inquiry</div><div class="hint">no inquiry attempts recorded</div>`;
+  const cards = tr.inquiry_attempts.map((a, i) => {
+    const cls = a.accepted ? "ok" : "bad";
+    const isOpen = a.accepted || openRejected();
+    const outcome = a.accepted ? `<span class="badge ok">unique → accepted</span>` : (a.error ? `<span class="badge bad">error</span>` : `<span class="badge bad">duplicate → retry</span>`);
+    const warn = a.verdict_ignored ? `<span class="badge warn">⚠ judge flagged dup (ignored)</span>` : "";
+    const genSeg = a.gen && a.gen.segment;
+    const chosen = new Set(a.doc_ids || []);
+    const body = `
+      <div class="stage s2"><div class="stage-head"><span class="stage-name">${STAGE.inq.n} ${STAGE.inq.name}</span>${toolSummary(genSeg)}<span class="right">${nodeMetrics(a.gen)}</span></div>
+        ${a.gen ? rolloutHtml(genSeg, `inq${a.attempt}`, chosen) : `<div class="empty">no generation row</div>`}
+        ${a.gen && a.gen.stats.error ? `<div class="errbox">${esc(a.gen.stats.error)}</div>` : ""}
+        <div class="outbox ${a.line_of_inquiry ? "" : "bad"}"><div class="ol">output</div>
+          ${kv("line of inquiry", a.line_of_inquiry ? esc(a.line_of_inquiry) : `<span class="empty">none (payload: ${esc(JSON.stringify(a.gen && a.gen.output))})</span>`)}
+          ${kv(`doc_ids (${(a.doc_ids||[]).length})`, docChips(a.doc_ids, "", new Set(tr.seed.doc_ids||[])))}
+        </div>
+      </div>
+      ${dedupStage(a.dedup, "inqdup", `inqdup${a.attempt}`, a)}
+      <div class="footer-row">${a.accepted ? `<span class="arrow">→</span> proceed to follow-up generation with this line of inquiry` : (i < tr.inquiry_attempts.length-1 ? `<span class="loop">↺ regenerate line of inquiry (try ${a.attempt+1})</span>` : `<span class="badge bad">exceeded MAX_INQUIRY_TRIES — question failed</span>`)}</div>`;
+    return `<details class="node attempt ${cls}" id="att-inq-${a.attempt}" ${isOpen?"open":""}><summary><span class="ti">▶</span>
+        <span class="badge step">try ${a.attempt}</span>${outcome}${warn}
+        <span class="node-summary">${esc((a.line_of_inquiry||"").slice(0,160))}</span>${sumMetrics([a.gen, a.dedup])}
+      </summary><div class="node-body">${body}</div></details>`;
+  });
+  return `<div class="section-title">${STAGE.inq.n}/${STAGE.inqdup.n} Line of inquiry <span class="sub">${tr.inquiry_attempts.length} attempt(s)</span></div>${cards.join("")}`;
+}
+
+// ── stage ④/⑤/⑥ ─────────────────────────────────────────────────────────────
+function followupSection(tr, f){
+  const nPrior = 1 + f.idx;   // seed + previously accepted pairs are in the prompt
+  const head = f.accepted_attempt != null ? `<span class="badge ok">accepted on try ${f.accepted_attempt}</span>` : `<span class="badge bad">no attempt accepted</span>`;
+  const cards = f.attempts.map((a, i) => {
+    const cls = a.accepted ? "ok" : "bad";
+    const isOpen = a.accepted || openRejected();
+    const outcome = a.accepted ? `<span class="badge ok">accepted</span>` : `<span class="badge bad">${esc(a.reject_reason)} → ${i < f.attempts.length-1 ? "retry" : "give up"}</span>`;
+    const warn = a.verdict_ignored ? `<span class="badge warn">⚠ judge flagged dup (ignored)</span>` : "";
+    const genSeg = a.gen && a.gen.segment;
+    const chosen = new Set(a.doc_ids || []);
+    const solvHtml = solverStage(a, `fu${f.idx}t${a.attempt}`);
+    const body = `
+      <div class="stage s4"><div class="stage-head"><span class="stage-name">${STAGE.fu.n} ${STAGE.fu.name}</span>
+          <span class="badge info" title="sampled from N(mean, std) of relevant chunks per question">target ${a.n_docs_target ?? f.n_docs_target ?? "?"} doc(s)</span>
+          <span class="badge info" title="sampled from N(mean, std) of answer nuggets per question">target ${a.n_nuggets_target ?? f.n_nuggets_target ?? "?"} nugget(s)</span>
+          <span class="badge dim" title="qa pairs shown to the agent as prior context">${nPrior} prior QA pair(s) in prompt</span>${toolSummary(genSeg)}<span class="right">${nodeMetrics(a.gen)}</span></div>
+        ${a.gen ? rolloutHtml(genSeg, `fu${f.idx}t${a.attempt}`, chosen) : `<div class="empty">no generation row</div>`}
+        ${a.gen && a.gen.stats.error ? `<div class="errbox">${esc(a.gen.stats.error)}</div>` : ""}
+        <div class="outbox ${a.question ? "" : "bad"}"><div class="ol">generated qa pair</div>
+          ${kv("question", a.question ? `<span class="q-text" style="font-size:13px">${esc(a.question)}</span>` : `<span class="empty">none (payload: ${esc(JSON.stringify(a.gen && a.gen.output))})</span>`)}
+          ${kv(`answer (${nuggetCount(a.answer)}/${a.n_nuggets_target ?? f.n_nuggets_target ?? "?"} nuggets)`, answerHtml(a.answer))}
+          ${kv(`doc_ids (${(a.doc_ids||[]).length}/${a.n_docs_target ?? "?"})`, docChips(a.doc_ids))}
+        </div>
+      </div>
+      ${solvHtml}
+      ${a.dedup_skipped ? `<div class="stage s6"><div class="stage-head"><span class="stage-name">${STAGE.qadup.n} ${STAGE.qadup.name}</span><span class="badge dim">skipped — not solvable</span></div></div>` : dedupStage(a.dedup, "qadup", `fudup${f.idx}t${a.attempt}`, a)}
+      <div class="footer-row">${a.accepted ? `<span class="arrow">→</span> appended as qa pair #${f.idx}; ${f.idx+1 < (tr.record && tr.record.qa_pairs ? tr.record.qa_pairs.length-1 : f.idx+1) ? `next follow-up sees ${nPrior+1} prior pairs` : "next follow-up (if any) sees "+(nPrior+1)+" prior pairs"}` : (i < f.attempts.length-1 ? `<span class="loop">↺ regenerate follow-up #${f.idx} (try ${a.attempt+1}) — ${esc(a.reject_reason)}</span>` : `<span class="badge bad">exceeded MAX_QA_PAIR_TRIES — question failed</span>`)}</div>`;
+    return `<details class="node attempt ${cls}" id="att-fu-${f.idx}-${a.attempt}" ${isOpen?"open":""}><summary><span class="ti">▶</span>
+        <span class="badge step">try ${a.attempt}</span>${outcome}${warn}
+        <span class="node-summary">${esc((a.question||"").slice(0,160))}</span>${sumMetrics([a.gen, a.solver, a.equivalence, a.dedup])}
+      </summary><div class="node-body">${body}</div></details>`;
+  });
+  return `<div class="section-title">${STAGE.fu.n}/${STAGE.solv.n}/${STAGE.qadup.n} Follow-up #${f.idx} <span class="sub">${f.attempts.length} attempt(s) · target ${f.n_docs_target ?? "?"} doc(s) · ${f.n_nuggets_target ?? "?"} nugget(s)</span> ${head}</div>${cards.join("")}`;
+}
+
+function solverStage(a, key){
+  if(!a.solver) return `<div class="stage s5"><div class="stage-head"><span class="stage-name">${STAGE.solv.n} ${STAGE.solv.name}</span><span class="badge dim">not run</span></div></div>`;
+  const verdict = a.solvable == null ? `<span class="badge dim">unknown</span>` : (a.solvable ? `<span class="badge ok">solvable ✓</span>` : `<span class="badge bad">not solvable ✗</span>`);
+  const how = a.exact_match ? `<span class="badge info">exact answer match</span>` : (a.equivalence ? `<span class="badge ${String(a.equivalence_verdict).toLowerCase().includes("true")?"ok":"bad"}">equivalence judge: ${esc(a.equivalence_verdict ?? "?")}</span>` : "");
+  const solvSeg = a.solver.segment, eqSeg = a.equivalence && a.equivalence.segment;
+  return `<div class="stage s5"><div class="stage-head"><span class="stage-name">${STAGE.solv.n} ${STAGE.solv.name}</span>${verdict}${how}<span class="right">${nodeMetrics(a.solver)}</span></div>
+    <div class="twocol">
+      <div class="outbox neutral"><div class="ol">generated answer (label)</div>${answerHtml(a.answer)}</div>
+      <div class="outbox ${a.solvable ? "" : "bad"}"><div class="ol">solver answer (given only the ${(a.doc_ids||[]).length} groundtruth doc(s))</div>${answerHtml(a.solver_answer)}</div>
+    </div>
+    ${a.solver.stats.error ? `<div class="errbox">${esc(a.solver.stats.error)}</div>` : ""}
+    ${rolloutHtml(solvSeg, key+"solv", new Set(), "solver rollout")}
+    ${a.equivalence ? `<div style="margin-top:6px"><div class="stage-head"><span class="badge dim">equivalence judge</span>${nodeMetrics(a.equivalence)}</div>${rolloutHtml(eqSeg, key+"eq", new Set(), "equivalence judge prompt & reply")}</div>` : ""}
+  </div>`;
+}
+
+function dedupStage(node, stageKey, key, a){
+  const st = STAGE[stageKey];
+  if(!node) return `<div class="stage s3"><div class="stage-head"><span class="stage-name">${st.n} ${st.name}</span><span class="badge dim">not run</span></div></div>`;
+  const flag = node.stats.unique == null ? `<span class="badge dim">recorded: ?</span>` : (node.stats.unique ? `<span class="badge ok">recorded: unique</span>` : `<span class="badge bad">recorded: duplicate</span>`);
+  const v = node.verdict || {};
+  const verdict = !node.segment ? `<span class="badge dim">no judge ran</span>` : (!v.parsed ? `<span class="badge warn">verdict unparsable</span>` : (v.flagged ? `<span class="badge bad">judge: duplicate of ${esc(v.duplicate_of)}</span>` : `<span class="badge ok">judge: not a duplicate</span>`));
+  const warn = a.verdict_ignored ? `<div class="warnbox"><b>Verdict not acted on.</b> The judge returned <code>duplicate = ${esc(JSON.stringify(v.raw))}</code>, but <code>follow_up_questions.py</code> only treats <code>duplicate is True</code> as a duplicate, so the recorded flag is <code>unique=True</code> and no retry was triggered.</div>` : "";
+  const reasoning = v.reasoning ? kv("judge reasoning", `<span style="color:var(--text2)">${esc(v.reasoning)}</span>`) : "";
+  const nb = node.neighbors || [];
+  const isInq = stageKey === "inqdup";
+  const hitId = v.duplicate_of;
+  const rows = nb.map((n, i) => `<tr class="${n.id === hitId ? "hit" : ""}"><td class="num">${i+1}</td><td class="mono">${esc(n.id)}${n.id === hitId ? " ◀" : ""}</td>${isInq ? `<td>${esc(n.line_of_inquiry)}</td>` : ""}<td>${esc(n.question)}</td><td>${esc(n.answer)}</td></tr>`).join("");
+  const nbHtml = nb.length ? `<details class="rollout"><summary>▸ ${nb.length} closest existing ${isInq ? "lines of inquiry" : "qa pairs"} shown to the judge (top-k by embedding)</summary>
+      <div class="tblwrap"><table class="tbl"><thead><tr><th>#</th><th>id</th>${isInq ? "<th>line of inquiry</th>" : ""}<th>${isInq ? "seed question" : "question"}</th><th>answer</th></tr></thead><tbody>${rows}</tbody></table></div></details>`
+    : (node.segment ? `<div class="empty">no neighbours parsed from the judge prompt</div>` : `<div class="empty">${esc(v.note || "embedding-only check")}</div>`);
+  return `<div class="stage ${isInq ? "s3" : "s6"}"><div class="stage-head"><span class="stage-name">${st.n} ${st.name}</span>${flag}${verdict}<span class="right">${nodeMetrics(node)}</span></div>
+    ${warn}${reasoning}${nbHtml}
+    ${node.segment ? rolloutHtml(node.segment, key, new Set(), "judge prompt & reply") : ""}
+  </div>`;
+}
+
+// ── final pairs + extras ────────────────────────────────────────────────────
+function nuggetCount(ans){ return Array.isArray(ans) ? ans.length : (ans == null || ans === "" ? 0 : 1); }
+function pairsCard(tr){
+  const qa = tr.record && tr.record.qa_pairs || [];
+  let pairs = qa.filter(p => p.idx != null);
+  if(!pairs.length && qa.length > 1) pairs = qa.slice(1).map((p, i) => ({ ...p, idx: i }));   // older records carry no idx
+  const byIdx = Object.fromEntries(tr.followups.map(f => [f.idx, f]));
+  if(!pairs.length) return `<div class="card"><div class="card-title">Accepted qa pairs</div><div class="empty">none — ${tr.record ? (tr.record.failed ? "question failed" : "no follow-ups recorded") : "no record yet"}</div></div>`;
+  const rows = pairs.map(p => `<tr class="clickable" onclick="VW.goto('att-fu-${p.idx}-${(byIdx[p.idx]||{}).accepted_attempt||1}')"><td class="num">${p.idx}</td><td class="num">${(byIdx[p.idx]||{}).attempts ? byIdx[p.idx].attempts.length : "?"}</td><td class="num">${p.n_docs_target ?? "?"}</td><td class="num">${p.n_nuggets_target ?? (byIdx[p.idx]||{}).n_nuggets_target ?? "?"}</td><td>${esc(p.question)}</td><td>${answerHtml(p.answer)}</td><td>${docChips(p.doc_ids)}</td></tr>`).join("");
+  return `<div class="card"><div class="card-title">Accepted qa pairs <span class="sub" style="text-transform:none;letter-spacing:0;font-weight:400">the follow-up chain written to qa_pairs.json for ${esc(tr.qid)}</span></div>
+    <div class="tblwrap"><table class="tbl"><thead><tr><th class="num">idx</th><th class="num">tries</th><th class="num">target docs</th><th class="num">target nuggets</th><th>question</th><th>answer</th><th>doc_ids</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+}
+function extrasCard(tr){
+  const parts = [];
+  if(tr.loose_events.length) parts.push(`<details class="rollout"><summary>▸ ${tr.loose_events.length} event(s) outside any agent segment</summary>${tr.loose_events.map(e => eventHtml(e, "loose")).join("")}</details>`);
+  if(tr.orphan_segments.length) parts.push(`<details class="rollout"><summary>▸ ${tr.orphan_segments.length} trace segment(s) that matched no stats row</summary>${tr.orphan_segments.map(s => `<div class="stage"><div class="stage-head"><span class="stage-name">${esc(s.type)}</span><span class="node-meta">events ${s.start_idx}–${s.end_idx}</span></div>${rolloutHtml(s, "orph"+s.i, new Set())}</div>`).join("")}</details>`);
+  if(tr.superseded_rows.length) parts.push(`<details class="rollout"><summary>▸ ${tr.superseded_rows.length} stats row(s) from an earlier (superseded) run of this question — trace overwritten on resume</summary>
+    <div class="tblwrap"><table class="tbl"><thead><tr><th>usage_key</th><th>type</th><th class="num">idx</th><th class="num">try</th><th>solvable</th><th>unique</th><th>state</th><th class="num">cost</th></tr></thead><tbody>${tr.superseded_rows.map(r => `<tr><td class="mono">${esc(r.usage_key)}</td><td>${esc(r.type)}</td><td class="num">${r.idx ?? ""}</td><td class="num">${r.attempt}</td><td>${r.solvable ?? ""}</td><td>${r.unique ?? ""}</td><td>${esc(r.terminate_state)}</td><td class="num">${fusd(r.cost_usd)}</td></tr>`).join("")}</tbody></table></div></details>`);
+  if(!parts.length) return "";
+  return `<div class="card"><div class="card-title">Diagnostics</div>${parts.join("")}</div>`;
+}
+
+// ── agent rollout rendering (turn-grouped event stream of one segment) ──────
+function toolSummary(seg){
+  if(!seg || !seg.tool_calls.length) return "";
+  const counts = {};
+  for(const t of seg.tool_calls) counts[t.name || "?"] = (counts[t.name || "?"]||0) + 1;
+  const surfaced = new Set(); for(const t of seg.tool_calls) for(const d of t.doc_ids) surfaced.add(d);
+  return Object.entries(counts).map(([n,c]) => `<span class="op-badge" style="background:${TOOL_COLOR[n]||"#999"}22;color:${TOOL_COLOR[n]||"#999"}">${esc(n)} ×${c}</span>`).join("") + `<span class="badge dim">${surfaced.size} docs surfaced</span>`;
+}
+function groupTurns(events){
+  const pre = [], turns = [], tail = [];
+  let pending = [], cur = null;
+  for(const e of events){
+    const k = e.kind, msg = e.message || "";
+    if(k === "assistant"){ cur = { lead:pending, assistant:e, toolCode:null, mid:[], results:[] }; pending = []; turns.push(cur); continue; }
+    if(k === "observation" || k === "error"){ if(cur) cur.results.push(e); else pre.push(e); continue; }
+    if(cur && cur.results.length === 0 && k !== "system" && k !== "user"){
+      if(k === "note" && msg.startsWith("tool_code")) cur.toolCode = e; else cur.mid.push(e);
+      continue;
+    }
+    if(!turns.length && !cur) pre.push(e); else pending.push(e);
+  }
+  for(const e of pending) tail.push(e);
+  return { pre, turns, tail };
+}
+function turnCost(t){ let s = 0; for(const e of [...t.lead, ...t.mid]) if(e.kind === "call" && e.data && typeof e.data.cost === "number") s += e.data.cost; return s; }
+function turnEnd(t){ let mx = null; for(const e of [...t.lead, t.assistant, t.toolCode, ...t.mid, ...t.results]) if(e && e.t != null && (mx == null || e.t > mx)) mx = e.t; return mx; }
+
+function rolloutHtml(seg, key, chosen, label){
+  if(!seg) return `<div class="empty">no trace segment aligned to this agent run</div>`;
+  const evs = seg.events;
+  const { pre, turns, tail } = groupTurns(evs);
+  const t0 = seg.t_start ?? 0;
+  let prevT = t0, cum = 0;
+  const tcByIdx = Object.fromEntries(seg.tool_calls.map(t => [t.event_idx, t]));
+  const parts = [pre.map(e => eventHtml(e, key)).join("")];
+  turns.forEach((t, i) => {
+    const tEnd = turnEnd(t), dt = tEnd != null ? Math.max(0, tEnd - prevT) : null, cumT = tEnd != null ? Math.max(0, tEnd - t0) : null;
+    const c = turnCost(t); cum += c;
+    const tc = t.toolCode ? tcByIdx[t.toolCode._idx] : null;
+    const text = evText(t.assistant);
+    const isFinal = /```json/.test(text) && !t.toolCode;
+    const name = tc ? tc.name : (isFinal ? "final" : "");
+    const preview = tc ? tc.code.split("\n").find(l => l.trim() && !l.trim().startsWith("#")) || tc.code : text.replace(/\s+/g, " ").slice(0, 160);
+    const stepM = /step=(\d+)/.exec(t.assistant.message || "");
+    const badge = name ? `<span class="op-badge" style="background:${TOOL_COLOR[name]||"#999"}22;color:${TOOL_COLOR[name]||"#999"}">${esc(name)}</span>` : "";
+    const retries = t.lead.filter(e => String(e.message||"").startsWith("parse_retry")).length;
+    const surfaced = tc && tc.doc_ids.length ? `<span class="badge dim" title="doc ids surfaced by this tool call (green = ended up in the final doc_ids)">${tc.doc_ids.length} docs</span>` : "";
+    const docsHtml = tc && tc.doc_ids.length ? `<div class="kv" style="margin-top:6px"><span class="k">docs surfaced</span><span class="v">${docChips(tc.doc_ids, "", chosen)}</span></div>` : "";
+    parts.push(`<details class="turn"><summary><span class="ti">▶</span><span class="node-meta">step ${stepM ? stepM[1] : i+1}</span>${badge}${retries ? `<span class="badge warn">${retries} parse retr${retries>1?"ies":"y"}</span>` : ""}${surfaced}
+        <span class="node-summary mono">${esc(preview.slice(0,150))}</span>
+        <span class="tmetrics">${metric("tlat","Δt",fsec(dt))}${metric("tlat","Σt",fsec(cumT))}${metric("tcost","Δ$",fusd(c))}${metric("tcost","Σ$",fusd(cum))}</span></summary>
+      <div class="turn-body">${t.lead.map(e => eventHtml(e, key)).join("")}${eventHtml(t.assistant, key)}${t.toolCode ? `<div class="msg compact" style="border-left-color:#888"><div class="msg-line mono">${esc(tc ? tc.code : t.toolCode.message)}</div></div>` : ""}${t.mid.map(e => eventHtml(e, key)).join("")}${t.results.map(e => eventHtml(e, key)).join("")}${docsHtml}</div>
+    </details>`);
+    if(tEnd != null) prevT = tEnd;
+  });
+  parts.push(tail.map(e => eventHtml(e, key)).join(""));
+  const summary = `${label || "agent rollout"} · ${turns.length} step(s) · ${seg.n_llm_calls} LLM call(s)${seg.n_embed_calls ? " · "+seg.n_embed_calls+" embed" : ""}${seg.n_parse_retries ? " · "+seg.n_parse_retries+" parse retr"+(seg.n_parse_retries>1?"ies":"y") : ""} · ${fsec(seg.t_end != null && seg.t_start != null ? seg.t_end - seg.t_start : null)} · ${fusd(seg.cost_usd)} · events ${seg.start_idx}–${seg.end_idx}`;
+  return `<details class="rollout"><summary>▸ ${esc(summary)}</summary>${parts.join("")}</details>`;
+}
+
+function eventHtml(e, key){
+  const kind = e.kind || "note";
+  if(kind === "system" && !showSystem()) return `<div class="msg compact"><div class="msg-line">[system prompt hidden — ${tok(evText(e).length)} tok — toggle "system prompts"]</div></div>`;
+  if(kind === "call" && !showCalls()) return "";
+  const style = KIND[kind] || KIND.note;
+  const ts = e.t != null ? `@${fsec(e.t)}` : "";
+  if(kind === "call" || kind === "note"){
+    const line = esc((e.message || "").replace(/\s+/g, " ").trim());
+    const warn = e.level === "warning" ? "color:var(--yellow)" : "";
+    return `<div class="msg compact" style="border-left-color:${style.color}"><div class="msg-line" style="${warn}">${ts ? `<span style="color:var(--text3)">${ts} </span>` : ""}${line}</div></div>`;
+  }
+  const k = `${key}:${e._idx}`, expanded = S.expanded.has(k);
+  const text = evText(e), lim = TRUNC[kind] || TRUNC.default;
+  const truncated = text.length > lim && !expanded;
+  const body = truncated ? text.slice(0, lim) + " …" : text;
+  const btn = text.length > lim ? `<button class="expand-btn" onclick="VW.toggleExpand('${k}')">${expanded ? "▲ collapse" : `▼ show full (~${tok(text.length)} tokens)`}</button>` : "";
+  const label = kind === "lifecycle" ? (String(e.message||"").split(" ")[0] || "lifecycle").replace(/_/g, " ") : style.label;
+  return `<div class="msg" style="border-left-color:${style.color};background:${style.bg}"><div class="msg-bar" style="color:${style.color}"><span>${esc(label)}</span><span class="meta">${ts} ~${tok(text.length)} tok</span></div><div class="msg-text">${esc(body)}</div>${btn}</div>`;
+}
+
+boot().catch(e => { $("content").innerHTML = `<div class="errbox">${esc(e.message || e)}</div>`; });
+</script>
+</body>
+</html>

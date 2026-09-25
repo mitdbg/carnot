@@ -139,8 +139,8 @@ view_figure: |-
   When you read a document and see a `<figure id=N>` placeholder (a chart/figure that is NOT in the searchable text), call this tool to actually *see* it. It returns an image of the **entire page** — so you see every figure on the page in context — appended to your messages, just like reading the page's text. Use it to judge whether a page whose answer may live in a chart is relevant. Pass the `doc_id` of the page you read.
 
   ```python
-  # you read doc_id "2002_12_8" and saw "<figure id=5>"; now view the page
-  view_figure("2002_12_8")
+  # the doc_id you read and saw "<figure id=5>"; now view the page
+  view_figure("<doc_id>")
   ```
 
 prune: |-

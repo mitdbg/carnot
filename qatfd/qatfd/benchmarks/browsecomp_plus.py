@@ -18,7 +18,7 @@ import json
 
 from jinja2 import Environment, StrictUndefined
 
-from skunk.common import ExecutionContext
+from skunk.common import ExecutionContext, PageLocator
 
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.judge import judge_single_nugget
@@ -93,15 +93,17 @@ class BrowseCompPlusBenchmark(Benchmark):
         }
 
     def _build_resources(self) -> BenchmarkResources:
-        collection = self._open_chroma_collection()
+        collection, client = self._open_chroma_collection()
         document_map = self._build_document_map()
         return BenchmarkResources(
             name=self.name,
             chroma_collection=collection,
+            chroma_client=client,
             document_map=document_map,
             answer_format_hint=self.answer_format_hint,
             compute_objective=self.compute_objective,
             corpus_details=self.corpus_details,
+            page_locator=None,
         )
 
     async def score(self, question: Question, predicted: str, ctx: ExecutionContext) -> dict:

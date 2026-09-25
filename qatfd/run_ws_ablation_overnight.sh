@@ -33,6 +33,9 @@
 #   PHASES=p1,p2,p3,p4            # comma-separated subset of phase labels to run
 #   CELLS=ws_coll_on_id_on,...    # comma-separated subset of cell labels to run
 #   CHROMA_HOST=127.0.0.1  CHROMA_PORT=8001
+#   COLLECTION_NAME=officeqa-qwen-8b   # corpus collection the eval opens (benchmarks.collection_name)
+#                                      # and the server warms; e.g. officeqa-qwen-8b-v1 for the
+#                                      # doc_id/chunk_id/element_id-only copy
 #   PYTHON=/home/ubuntu/carnot/skunk/venv/bin/python3
 set -uo pipefail   # no -e: one failed run must not kill the rest of the sweep
 cd "$(dirname "$0")"
@@ -45,7 +48,7 @@ PROVIDER="${PROVIDER-}"
 PHASES="${PHASES-}"
 CELLS="${CELLS-}"
 OFFICEQA_CHROMA_DIR="$(pwd)/benchmarks/officeqa/chromadb"
-OFFICEQA_COLLECTION="officeqa-qwen-8b"
+COLLECTION_NAME="${COLLECTION_NAME:-officeqa-qwen-8b}"
 SYNTH_QA_PAIRS="$(pwd)/benchmarks/officeqa/synth_dev_qa_pairs.json"
 
 : "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set in the environment}"
@@ -91,7 +94,7 @@ else
   SKUNK_CHROMADB_DIR="$OFFICEQA_CHROMA_DIR" \
   SKUNK_CHROMA_SERVER_HOST="$CHROMA_HOST" \
   SKUNK_CHROMA_SERVER_PORT="$CHROMA_PORT" \
-    nohup bash ../skunk/scripts/run_chroma_server.sh "$OFFICEQA_COLLECTION" \
+    nohup bash ../skunk/scripts/run_chroma_server.sh "$COLLECTION_NAME" \
     > "$LOG_DIR/chroma_server.log" 2>&1 &
   ready=0
   for _ in $(seq 1 180); do
@@ -106,9 +109,8 @@ fi
 wipe_working_sets() {
   "$PYTHON" -c "
 from skunk.chroma_client import make_chroma_client
-from skunk.search_state.working_set_registry import WS_PREFIX
 client = make_chroma_client('${CHROMA_HOST}', ${CHROMA_PORT})
-names = [c.name for c in client.list_collections() if c.name.startswith(WS_PREFIX)]
+names = [c.name for c in client.list_collections() if c.metadata.get("is_working_set")]
 for name in names:
     client.delete_collection(name)
 print(f'[sweep] wiped {len(names)} working-set collection(s)')
@@ -155,7 +157,7 @@ for phase_entry in "${PHASE_CONFIGS[@]}"; do
     echo "==================================================================="
     echo "=== $benchmark | search_agent | $run_name"
     echo "===   collection_off=$coll_off id_tracking_off=$id_off fetch_related=$fetch_related"
-    echo "===   model=$MODEL | workers=$workers${qids:+ | qids=$n_synth-question synth subset}"
+    echo "===   model=$MODEL | workers=$workers | collection=$COLLECTION_NAME${qids:+ | qids=$n_synth-question synth subset}"
     echo "==================================================================="
     if ! wipe_working_sets; then
       echo "[sweep] ERROR: working-set wipe failed for $run_name; skipping run" >&2
@@ -175,6 +177,7 @@ for phase_entry in "${PHASE_CONFIGS[@]}"; do
       systems.working_set_collection_off="$coll_off" \
       systems.id_tracking_off="$id_off" \
       systems.fetch_related_working_sets="$fetch_related" \
+      benchmarks.collection_name="$COLLECTION_NAME" \
       benchmarks.chroma_server_host="$CHROMA_HOST" \
       benchmarks.chroma_server_port="$CHROMA_PORT" \
       experiments.workers="$workers" \

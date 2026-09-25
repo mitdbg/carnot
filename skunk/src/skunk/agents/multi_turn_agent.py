@@ -48,6 +48,7 @@ class ChunkBlock(Block):
     chunk_id: str | None
     doc_id: str
     text: str
+    collection: str | None = None
 
 @dataclass
 class ImageBlock(Block):
@@ -243,6 +244,16 @@ class MultiTurnAgent(ABC):
         # turns still see the variables earlier steps defined).
         self._executor = self._build_executor()
 
+    @property
+    def step(self) -> int:
+        """Number of steps the most recent `call()` executed (read-only; see `_run_loop`)."""
+        return self._step
+
+    @property
+    def terminate_state(self) -> str:
+        """Why the most recent `call()` stopped: "finished", "out_of_steps", "over_cost_budget", ..."""
+        return self._terminate_state
+
     def _resolve_effort(self, ctx: ExecutionContext) -> Effort:
         """Effort setting for LLM calls; falls back to inference config default if not specified."""
         return ctx.config.inference.effort if self.config.effort is None else self.config.effort
@@ -312,8 +323,9 @@ class MultiTurnAgent(ABC):
                     if isinstance(block, ImageBlock) and doc_ids is not None and block.doc_id in doc_ids:
                         block.visible = False
 
-    def _blocks_from_output(self, ctx: ExecutionContext, out: CodeOutput) -> list[Block]:
-        """Turn one tool-execution result into observation blocks.
+    def _handle_tool_call(self, ctx: ExecutionContext, out: CodeOutput) -> list[Block]:
+        """Handle one tool-execution result and generate any observation blocks
+        which need to go into its context.
 
         Default: stdout / result rendered as `TextBlock`s — identical to the
         pre-block flat-string observation. Subclasses override to emit
@@ -717,7 +729,7 @@ class MultiTurnAgent(ABC):
                     obs_blocks.append(TextBlock(f"[error]\n{observation.error}"))
                 else:
                     assert observation.output is not None
-                    obs_blocks.extend(self._blocks_from_output(ctx, observation.output))
+                    obs_blocks.extend(self._handle_tool_call(ctx, observation.output))
                 if step_output and step_output.notice:
                     obs_blocks.append(TextBlock(f"[notice]\n{step_output.notice}"))
 

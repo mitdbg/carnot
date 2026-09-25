@@ -204,7 +204,7 @@ class QampariBenchmark(Benchmark):
     # ---- retrieval substrate --------------------------------------------------
 
     def _build_resources(self) -> BenchmarkResources:
-        collection = self._open_chroma_collection()
+        collection, client = self._open_chroma_collection()
         self._collection = collection
         # ~25.9M chunks is far too much for an in-RAM {chunk_id: text} dict, so serve the passage text
         # lazily + cached from the chroma `documents` column (only the chunks a question actually reads
@@ -212,9 +212,11 @@ class QampariBenchmark(Benchmark):
         return BenchmarkResources(
             name=self.name,
             chroma_collection=collection,
+            chroma_client=client,
             document_map=_ChromaDocMap(collection),
             answer_format_hint=self.answer_format_hint,
             compute_objective=self.compute_objective,
+            page_locator=None,
         )
 
     # ---- scoring + metrics ----------------------------------------------------

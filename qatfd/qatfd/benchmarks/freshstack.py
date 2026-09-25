@@ -171,13 +171,15 @@ class FreshstackBenchmark(Benchmark):
         return {fid: "\n".join(text for _, text in sorted(slices)) for fid, slices in by_file.items()}
 
     def _build_resources(self) -> BenchmarkResources:
-        collection = self._open_chroma_collection()
+        collection, client = self._open_chroma_collection()
         return BenchmarkResources(
             name=self.name,
             chroma_collection=collection,
+            chroma_client=client,
             document_map=self._build_document_map(),
             answer_format_hint=self.answer_format_hint,
             compute_objective=self.compute_objective,
+            page_locator=None,
         )
 
     # ---- scoring + metrics ----------------------------------------------------

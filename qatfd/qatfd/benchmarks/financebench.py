@@ -22,7 +22,9 @@ from __future__ import annotations
 import glob
 import json
 
-from skunk.common import ExecutionContext
+from pathlib import Path
+
+from skunk.common import ExecutionContext, PageLocator, PageSource
 
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.judge import judge_single_nugget
@@ -32,6 +34,22 @@ from qatfd.keys import financebench_doc as _page_key_to_doc
 from qatfd.keys import financebench_page_key as page_key
 from qatfd.paths import resolve_under_benchmarks
 from qatfd.types import Question
+
+
+class FinanceBenchPageLocator(PageLocator):
+    """Returns the PDF page for a given FinanceBench doc_id."""
+
+    def __init__(self, pdf_dir: Path):
+        self._pdf_dir = pdf_dir
+
+    def lookup(self, doc_id: str) -> PageSource | None:
+        try:
+            stem, zero_index_page_num = doc_id.split("::p")
+            pdf_path = self._pdf_dir / f"{stem}.pdf"
+        except:
+            return None
+
+        return PageSource(pdf_path=pdf_path, page_num=int(zero_index_page_num) + 1)
 
 
 def financebench_recall_metrics(retrieved: list[str] | None, gold_page_keys: list[str]) -> dict[str, float]:
@@ -133,13 +151,16 @@ class FinanceBenchBenchmark(Benchmark):
         return {key: "\n\n".join(elements[k] for k in sorted(elements)) for key, elements in by_doc.items()}
 
     def _build_resources(self) -> BenchmarkResources:
-        collection = self._open_chroma_collection()
+        collection, client = self._open_chroma_collection()
+        page_locator = FinanceBenchPageLocator(Path(self.config.storage.pdf_dir)) if self.config.storage.pdf_dir else None
         return BenchmarkResources(
             name=self.name,
             chroma_collection=collection,
+            chroma_client=client,
             document_map=self._build_document_map(),
             answer_format_hint=self.answer_format_hint,
             compute_objective=self.compute_objective,
+            page_locator=page_locator,
         )
 
     # ---- scoring + metrics ----------------------------------------------------

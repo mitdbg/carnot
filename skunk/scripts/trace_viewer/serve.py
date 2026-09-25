@@ -10,6 +10,11 @@ This server discovers those run dirs and serves, per question, the ordered
 event list so the frontend (`app.html`) can render the Orchestrator's plan and
 each operator node's color-coded agent trace.
 
+Multi-pass runs (qatfd `scripts/bootstrap_enrich_upper_bound.py`: the same questions
+answered several times by one system) keep one trace tree per pass, `traces/pass<N>/<qid>.jsonl`,
+and a `pass` column in report.csv. Their questions are addressed as `<qid>@pass<N>` (the
+`uid`), which maps back onto that subdirectory.
+
 Run from the skunk/ directory:
 
     python3 scripts/trace_viewer/serve.py
@@ -53,7 +58,8 @@ def _find_runs(root: pathlib.Path) -> list[str]:
     def _walk(d: pathlib.Path) -> None:
         if not d.is_dir():
             return
-        if any((d / "traces").glob("*.jsonl")) or (d / "report.csv").exists():
+        traces = d / "traces"
+        if any(traces.glob("*.jsonl")) or any(traces.glob("*/*.jsonl")) or (d / "report.csv").exists():
             rel = d.relative_to(root)
             if rel not in seen:
                 seen.add(rel)
@@ -77,7 +83,8 @@ def _read_report(run_dir: pathlib.Path) -> list[dict]:
     Normalizes the qatfd runner's column names onto the viewer's canonical ones:
     `qid`->`uid`, `gold`->`gold_answer`, and the legacy `correct` column ->`score`
     (skunk's eval_e2e.py still writes `correct`; the qatfd runner writes `score`).
-    eval_e2e.py rows otherwise pass through unchanged."""
+    eval_e2e.py rows otherwise pass through unchanged. A multi-pass report (a `pass`
+    column) repeats each qid once per pass, so its uid is `<qid>@pass<N>`."""
     path = run_dir / "report.csv"
     if not path.exists():
         return []
@@ -85,7 +92,7 @@ def _read_report(run_dir: pathlib.Path) -> list[dict]:
         rows = list(csv.DictReader(f))
     for r in rows:
         if not r.get("uid") and r.get("qid"):
-            r["uid"] = r["qid"]
+            r["uid"] = f"{r['qid']}@pass{r['pass']}" if r.get("pass") else r["qid"]
         if not r.get("gold_answer") and r.get("gold"):
             r["gold_answer"] = r["gold"]
         if r.get("score") in (None, "") and r.get("correct") not in (None, ""):
@@ -111,8 +118,12 @@ def _load_events(path: pathlib.Path) -> list[dict]:
 
 
 def _trace_uids(run_dir: pathlib.Path) -> list[str]:
-    """Uids with a per-question trace file, sorted lexicographically."""
-    return sorted(p.stem for p in (run_dir / "traces").glob("*.jsonl"))
+    """Uids with a per-question trace file, sorted lexicographically; a trace in a pass
+    subdirectory (`traces/pass1/X.jsonl`) is addressed as `X@pass1`."""
+    traces = run_dir / "traces"
+    flat = [p.stem for p in traces.glob("*.jsonl")]
+    nested = [f"{p.stem}@{p.parent.name}" for p in traces.glob("*/*.jsonl")]
+    return sorted(flat + nested)
 
 
 def _run_questions(run_dir: pathlib.Path) -> list[dict]:
@@ -128,11 +139,14 @@ def _run_questions(run_dir: pathlib.Path) -> list[dict]:
 def _question_events(run_dir: pathlib.Path, uid: str) -> list[dict]:
     """All events for one uid, in file (== chronological per-question) order. Every
     field — message / step_idx / op / level / kind / data — is preserved for the
-    frontend to structure. The uid names a file under the run's traces/, so reject
-    anything that could escape it."""
-    if not uid or "/" in uid or "\\" in uid or uid in (".", ".."):
+    frontend to structure. The uid names a file under the run's traces/ (`X` ->
+    traces/X.jsonl; `X@pass1` -> traces/pass1/X.jsonl), so reject anything that could
+    escape it."""
+    stem, _, sub = uid.partition("@")
+    parts = [stem, sub] if sub else [stem]
+    if not stem or any(not p or "/" in p or "\\" in p or p in (".", "..") for p in parts):
         return []
-    return _load_events(run_dir / "traces" / f"{uid}.jsonl")
+    return _load_events(run_dir / "traces" / sub / f"{stem}.jsonl") if sub else _load_events(run_dir / "traces" / f"{stem}.jsonl")
 
 
 # ── HTTP handler ────────────────────────────────────────────────────────────

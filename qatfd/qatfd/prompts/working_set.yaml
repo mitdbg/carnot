@@ -1,0 +1,11 @@
+working_set_summary: |-
+  ===== Collection (name="{{ name }}") =====
+  Description: {{ description }}
+  Number of chunks: {{ total_num_chunks }}
+  {%- if metadata_fields %}
+  Metadata fields:
+  {{ metadata_fields }}
+  {%- else %}
+  Metadata fields: None
+  {%- endif %}
+  {{ actions }}

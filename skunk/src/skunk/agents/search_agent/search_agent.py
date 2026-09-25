@@ -4,7 +4,7 @@ Subclasses `MultiTurnAgent`: it supplies the search-specific system prompt
 and the chroma-backed tool set (`search_corpus` / `grep_corpus` / `semantic_filter`
 / `read_document` / `prune`). The tools share the agent's `WorkingSet`.
 
-`_blocks_from_output()` turns the tools' structured (tagged-dict) returns into
+`_handle_tool_call()` turns the tools' structured (tagged-dict) returns into
 `ChunkBlock`s (one per chunk, carrying chunk_id / doc_id) so the full trajectory
 is preserved (useful for metrics and future reward computation).
 """
@@ -44,14 +44,14 @@ from skunk.agents.search_agent.search_tools import (
     SemanticFilterTool,
     ViewFigureTool,
 )
-from skunk.common import B64Image, ExecutionContext, strip_code_fence
+from skunk.common import B64Image, ExecutionContext, PageLocator, strip_code_fence
 from skunk.config import SearchAgentConfig, StorageConfig
 from skunk.errors import ParseError, StepFailed
 from skunk.llm_client import LLMClient
 from skunk.prompts import load_prompts
 from skunk.sandbox.local_python_executor import CodeOutput, BASE_BUILTIN_MODULES
 from skunk.search_state.working_set import WorkingSet
-from skunk.search_state.working_set_registry import WorkingSetRegistry, WS_PREFIX, DEFAULT_CHROMA_PATH
+from skunk.search_state.working_set_registry import WorkingSetRegistry, DEFAULT_CHROMA_PATH
 from skunk.storage.document_map import DocumentMap
 
 _ENV = Environment(
@@ -60,7 +60,7 @@ _ENV = Environment(
 _PROMPTS = load_prompts("search_agent")
 
 _JSON_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_]*)\n(.*?)```", re.DOTALL)
-
+_UPSERT_STEP = 256
 
 def _parse_list(text: str) -> list[str]:
     """Parse the model's reply as a JSON array of strings, raising `ParseError` on
@@ -129,6 +129,7 @@ class SearchAgent(MultiTurnAgent):
         registry: WorkingSetRegistry | None = None,
         working_set_name: str | None = None,
         additional_notes: str | None = None,
+        page_locator: PageLocator | None = None,
     ):
         # override the default agent_id if one is provided
         config.agent_id = config.agent_id if agent_id is None else agent_id
@@ -136,15 +137,15 @@ class SearchAgent(MultiTurnAgent):
         # set variables
         self.document_map = document_map
         self.chroma_collection = chroma_collection
+        self.page_locator = page_locator
         self._llm_client = llm_client
         self._registry = registry or WorkingSetRegistry(chroma_path=DEFAULT_CHROMA_PATH)
 
         # create (or get) working set for agent
-        working_set_name = f"{WS_PREFIX}{working_set_name if working_set_name else config.agent_id}"
+        working_set_name = working_set_name if working_set_name else config.agent_id
         self._working_set = self._registry.get_or_create(name=working_set_name)
 
         # construct the SearchAgent's tools
-        # NOTE: if we ever stray from this approach 
         tools = self._build_tools(config, storage_config)
 
         # construct the system prompt
@@ -179,7 +180,7 @@ class SearchAgent(MultiTurnAgent):
 
         return self._llm_client.config.llm_model
 
-    def _blocks_from_output(self, ctx: ExecutionContext, out: CodeOutput) -> list[Block]:
+    def _handle_tool_call(self, ctx: ExecutionContext, out: CodeOutput) -> list[Block]:
         """Render a tool result into blocks. Chunk-bearing payloads become one
         `ChunkBlock` per chunk (redactable); everything else is a `TextBlock`."""
         blocks: list[Block] = []
@@ -415,6 +416,7 @@ class SearchAgent(MultiTurnAgent):
                 self._llm_client,
                 self._working_set,
                 usage_key=config.agent_id,
+                timeout_s=config.request_timeout_s,
                 working_set_collection_off=config.working_set_collection_off,
                 id_tracking_off=config.id_tracking_off,
             ))
@@ -440,9 +442,9 @@ class SearchAgent(MultiTurnAgent):
                 id_tracking_off=config.id_tracking_off,
             ))
 
-        if storage_config.pdf_dir is not None:
+        if self.page_locator is not None:
             tools.append(ViewFigureTool(
-                self.document_map, storage_config.pdf_dir, renders_dir=storage_config.page_renders_dir,
+                self.document_map, self.page_locator, renders_dir=storage_config.page_renders_dir,
             ))
 
         return tools
@@ -554,13 +556,18 @@ class SearchAgent(MultiTurnAgent):
                 # copy data
                 if working_set_collection_on:
                     results = ancestor.collection.get(include=["documents", "metadatas", "embeddings"])
-                    if results["ids"]:
-                        self._working_set.collection.upsert(
-                            ids=results["ids"],
-                            embeddings=results["embeddings"],
-                            metadatas=results["metadatas"],
-                            documents=results["documents"],
-                        )
+                    ids, embs = results["ids"], results["embeddings"]
+                    metas, docs = results["metadatas"], results["documents"]
+                    if ids and embs is not None and metas is not None and docs is not None:
+                        # chroma 1.x rejects requests over 40 MB (413 "Payload too large"); a 4096-dim
+                        # float embedding is ~40 KB as JSON, so keep upserts to a few hundred chunks
+                        for i in range(0, len(ids), _UPSERT_STEP):
+                            self._working_set.collection.upsert(
+                                ids=ids[i:i + _UPSERT_STEP],
+                                embeddings=embs[i:i + _UPSERT_STEP],
+                                metadatas=metas[i:i + _UPSERT_STEP],
+                                documents=docs[i:i + _UPSERT_STEP],
+                            )
 
                 # union fetched chunk/doc ids
                 self._working_set.fetched_chunk_ids = self._working_set.fetched_chunk_ids.union(ancestor.fetched_chunk_ids)
@@ -573,6 +580,7 @@ class SearchAgent(MultiTurnAgent):
                 data={"time": t2 - t1},
             )
 
+        # TODO: NOTE: THIS MESSAGE NEVER REACHES THE AGENT B/C MULTI_TURN_AGENT BLOWS AWAY THE MESSAGE HISTORY IF NOT RESUMING
         # add message summarizing the state of the working set
         if working_set_collection_on or id_tracking_on:
             self._add_working_set_message()

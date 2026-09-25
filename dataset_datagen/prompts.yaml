@@ -1,15 +1,18 @@
 datagen_line_of_inquiry_system_prompt: |
-  You are a data-generation assistant. You will be presented with an initial question-answer pair grounded in real documents from a corpus. Your job is to hypothesize a line of inquiry that an analyst might be pursuing which this is the first question of.
+  You are a data-generation assistant. You will be presented with an initial question-answer pair grounded in real documents from a corpus. Your job is to hypothesize a broad line of inquiry that an analyst might be pursuing over this corpus given the initial question.
 
   You will be given:
   1. An initial question-answer pair and supporting documents which that question-answer pair is grounded in.
-  2. A set of tools for exploring the corpus to find related documents and information.
+  2. A set of tools for exploring the corpus to find documents and information.
 
-  Your job is to:
-  1. **Explore** the corpus using the search tools below to find related documents which could support a rich line of inquiry. You should use the initial question-answer pair and its grounding document(s) as a seed to explore related topics, entities, or time periods.
-  2. **Synthesize** a line of inquiry that is plausible given the initial question-answer pair and the related documents you have found. The line of inquiry should be the analyst's overarching research question or investigation that the initial question-answer pair is a part of. It should be specific enough to guide further questions, but broad enough to allow for multiple follow-up questions.
+  Your job is to iteratively:
+  1. **Explore** the corpus using the search tools below to find documents which could support a broad line of inquiry.
+  2. **Synthesize** a line of inquiry that is plausible given the initial question-answer pair and the documents you have explored.
 
   The corpus is organised as a set of *documents*, each identified by a `doc_id`. Every document is further split into *chunks* (text spans, table fragments, titles, etc.), each identified by a `chunk_id`. The exact metadata schema and identifier formats for this corpus are described in the "Notes About This Corpus" section below.
+
+  ## Line of Inquiry criteria
+  The line of inquiry should be a sentence which defines the bigger question / theme an analyst is pursuing. It is the overarching research question or investigation that the initial question-answer pair is a part of. It should be broad enough to allow for multiple follow-up questions.
 
   ## Response Format
   On every step, output EITHER one fenced python code block:
@@ -42,8 +45,17 @@ datagen_line_of_inquiry_user_prompt: |
   Answer: {{ answer }}
   Supporting Docs: {{ supporting_docs }}
 
+datagen_line_of_inquiry_feedback_prompt: |
+  You previously generated the following line of inquiry which was deemed a duplicate (or too similar) to an existing line of inquiry:
+
+  Previous Line of Inquiry: {{ prev_line_of_inquiry }}
+  Duplicate of: {{ duplicate_line_of_inquiry }}
+  Reason: {{ duplicate_reason }}
+
+  Please try to generate a new line of inquiry which takes this feedback into account.
+
 datagen_follow_up_question_system_prompt: |
-  You are a data-generation assistant. You will be presented with one or more initial question-answer pairs grounded in real documents from a corpus. These question-answer pairs represent a sequence of questions that an analyst might ask as part of a line of inquiry. Your task is to synthesise **a new, follow-up question-answer pair** that is grounded in real documents from the same corpus. Your new question should be distinct from the previous questions, and continue the analyst's line of inquiry in a natural way.
+  You are a data-generation assistant. You will be presented with one or more initial question-answer pairs grounded in real documents from a corpus. These question-answer pairs represent a sequence of questions that an analyst is asking as part of a line of inquiry. Your task is to synthesise **a new, follow-up question-answer pair** that is grounded in real documents from the same corpus. Your new question should be distinct from the previous questions, and continue the analyst's line of inquiry in a natural way.
 
   You will be given:
   1. Initial question-answer pair(s) and supporting documents which those question-answer pair(s) are grounded in.
@@ -51,7 +63,7 @@ datagen_follow_up_question_system_prompt: |
   3. A set of documents which may be relevant to the line of inquiry.
 
   Your job is to:
-  1. **Explore** the corpus using the search tools below to find supporting evidence for a *new* question-answer pair which continues the analyst's line of inquiry. Your supporting evidence may come from new documents which are not included in the list of relevant `doc_id`s. Your question-answer pair should be grounded in **{{ n_docs }} supporting doc(s)** from the corpus.
+  1. **Explore** the corpus using the search tools below to find supporting evidence for a *new* question-answer pair which continues the analyst's line of inquiry. Your supporting evidence may include new documents which are not included in the list of relevant `doc_id`s.
   2. **Compose** each new question so that its answer can only be correctly derived from the specific chunks you've identified. Each question must be genuinely different from the questions already in the line of inquiry: no paraphrases, simple inversions, or trivial variants. It is okay for your new question to build on a previous question, but it must restate (part of) the previous question such that it can be answered in isolation. For example, "what is the growth rate between X and Y?" is acceptable, but "what is the growth rate between X and the previous answer?" is not.
   3. **Formulate each answer as a list of "nuggets"** -- key pieces of information essential to the answer. A nugget is a single atomic fact (an entity, a statistic, a date, a short phrase, etc.). Many answers will be a single nugget (e.g. an entity, a statistic, a date); some richer questions may require multiple nuggets to be considered fully answered. The set of nuggets should be the *minimum* information needed for a downstream system to be judged as correctly answering the question.
   4. **Return** your new question-answer pair as your final answer (a JSON block; see "Final Answer" below).
@@ -90,6 +102,17 @@ datagen_follow_up_question_system_prompt: |
 
   You have {{ max_steps }} steps in total. Use early steps to explore the corpus for relevant chunk(s) in the line of inquiry, then narrow your exploration to the most promising chunk(s) before emitting your final question-answer pair.
 
+  For this question you are about to generate:
+  1. Your question-answer pair should be grounded in **{{ n_docs }} supporting doc(s)** from the corpus.
+  2. Your answer should consist of **{{ n_nuggets }} nugget(s)**.
+  {% if example_qa_pairs %}
+  ## Example Questions From This Benchmark
+  The following are real question-answer pairs from this benchmark, drawn at random. They illustrate the *style* and *difficulty* of the questions you should produce (their answers are shown as plain strings; yours must still be a list of nuggets). Do not copy, paraphrase, or trivially vary any of them -- they are unrelated to the line of inquiry below and are provided only as a reference for what a good question looks like.
+  {% for qa in example_qa_pairs %}
+  Example {{ loop.index }}
+  Question: {{ qa["question"] }}
+  Answer: {{ qa["answer"] }}
+  {% endfor %}{% endif %}
   ## Notes About This Corpus
   {{ special_notes }}
 
@@ -103,6 +126,18 @@ datagen_follow_up_question_user_prompt: |
   Supporting Docs {{ loop.index }}: {{ qa["supporting_docs"] }}
 
   {% endfor %}
+
+datagen_follow_up_question_feedback_prompt: |
+  You previously generated the following question-answer pair which was deemed a duplicate (or too similar) to an existing question-answer pair:
+
+  Previous QA Pair Question: {{ prev_qa_pair_question }}
+  Previous QA Pair Answer: {{ prev_qa_pair_answer }}
+  Duplicate of QA Pair Question: {{ duplicate_question }}
+  Duplicate of QA Pair Answer: {{ duplicate_answer }}
+  Reason: {{ duplicate_reason }}
+
+  Please try to generate a new question-answer pair which takes this feedback into account.
+
 
 datagen_solver_system_prompt: |
   You are an agent whose job is to answer a question given a set of groundtruth document(s). The question is meant to be grounded in the groundtruth document(s), so ideally it should be relatively straightforward to answer the question given these document(s). You will have up to {{ max_steps }} steps to answer the question. In each step you may execute python code (perhaps to perform some intermediate competition) or return your final answer. If for any reason you feel the groundtruth documents are insufficient, you must still produce a final answer to the best of your ability.
@@ -161,6 +196,16 @@ datagen_answer_equivalence_user_prompt: |
   Groundtruth Docs: {{ groundtruth_docs }}
   Label Answer: {{ answer }}
   Predicted Answer: {{ pred_answer }}
+
+#####################
+## terminal prompt ##
+#####################
+terminal_prompt: |-
+  Do NOT call any tool now — emit exactly one ```json``` block with your final answer:
+
+  ### Final Answer Requirements
+  Your final answer must be a JSON object which adheres to the final answer guidelines shared in the system prompt.
+
 
 #################################################################
 ## special notes about each corpus (including metadata fields) ##
@@ -367,7 +412,7 @@ dedup_line_of_inquiry_judge_prompt: |
 
   **Output Format:** Respond with a JSON object and nothing else. The JSON object should contain:
   - "duplicate": either the ID which this line of inquiry is a duplicate of or None if this is not a duplicate
-  - "reasoning": either a string explaining why this is a duplicate or None if this is not a duplicate
+  - "reasoning": either a string explaining why this is a duplicate or None if this is not a duplicate; if this is a duplicate, please give an informative string which can help the agent generating lines of inquiry fix its mistake.
 
   ```json
   {"duplicate": <id> or None, "reasoning": <reasoning string> or None}
@@ -415,7 +460,7 @@ dedup_qa_pair_judge_prompt: |
 
   **Output Format:** Respond with a JSON object and nothing else. The JSON object should contain:
   - "duplicate": either the question id which this question is a duplicate of or None if this is not a duplicate
-  - "reasoning": either a string explaining why this is a duplicate or None if this is not a duplicate
+  - "reasoning": either a string explaining why this is a duplicate or None if this is not a duplicate; if this is a duplicate, please give an informative string which can help the agent generating question-answer pairs fix its mistake.
 
   ```json
   {"duplicate": <qid> or None, "reasoning": <reasoning string> or None}

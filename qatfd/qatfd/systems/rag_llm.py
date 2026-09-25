@@ -32,6 +32,7 @@ class RAGLLMSystem(RetrieveComputeSystem):
             ctx.llm_client,
             WorkingSet(collection=resources.chroma_collection),
             usage_key=str(self.retrieve_usage_key),
+            timeout_s=self.retrieve_config.request_timeout_s,
             working_set_collection_off=True,
             id_tracking_off=True,
         )

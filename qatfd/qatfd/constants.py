@@ -6,3 +6,6 @@ TREC_BIOGEN = "trec_biogen"
 FINANCE_BENCH = "financebench"
 QAMPARI = "qampari"
 FRESHSTACK = "freshstack"
+
+# delimiter for chroma collection metadata
+METADATA_LIST_DELIMITER = "||"

@@ -102,13 +102,14 @@ class Tracer:
         self._start_time = start_time or time.monotonic()
         self._verbose = verbose
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-        self._logfile = open(log_path, "w", encoding="utf-8")
+        self._log_file = open(log_path, "w", encoding="utf-8")
+        self.log_path = Path(log_path)
 
     def close(self) -> None:
         """Close the per-question log file, if one was opened."""
-        if self._logfile is not None:
-            self._logfile.close()
-            self._logfile = None
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
 
     @staticmethod
     def truncate(s: str, cap: int, suffix: str = "…") -> str:
@@ -179,9 +180,9 @@ class Tracer:
         )
 
         # write the event to the logfile
-        if self._logfile is not None:
-            self._logfile.write(json.dumps(event.model_dump(), default=str, ensure_ascii=False) + "\n")
-            self._logfile.flush()
+        if self._log_file is not None:
+            self._log_file.write(json.dumps(event.model_dump(), default=str, ensure_ascii=False) + "\n")
+            self._log_file.flush()
 
         # render and print to console if verbose=True
         if self._verbose:

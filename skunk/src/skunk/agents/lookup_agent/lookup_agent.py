@@ -29,7 +29,7 @@ class LookupAgent(MultiTurnAgent):
 
         return step_output
 
-    # TODO: should LookupAgent override _blocks_from_output()?
+    # TODO: should LookupAgent override _handle_tool_call()?
     def __init__(self, config: LookupAgentConfig, *, agent_id: str | None = None, additional_notes: str | None = None):
         # override the default agent_id if one is provided
         config.agent_id = config.agent_id if agent_id is None else agent_id

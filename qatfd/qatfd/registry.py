@@ -5,6 +5,8 @@ Adding a benchmark/system is one import + one dict entry here.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from qatfd.benchmarks.base import Benchmark
 from qatfd.benchmarks.browsecomp_plus import BrowseCompPlusBenchmark
 from qatfd.benchmarks.financebench import FinanceBenchBenchmark
@@ -46,9 +48,11 @@ def build_system(
     retrieve_config: AgentConfig | None = None,
     compute_config: AgentConfig | None = None,
     codex_config: AgentConfig | None = None,
+    run_dir: Path | None = None,
 ) -> System:
     if codex_config is not None:
-        return CodexSystem(codex_config, inference)
+        assert run_dir is not None
+        return CodexSystem(codex_config, inference, run_dir)
 
     assert retrieve_config is not None and compute_config is not None
     name = retrieve_config.name
