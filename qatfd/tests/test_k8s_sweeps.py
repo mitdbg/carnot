@@ -102,12 +102,12 @@ def test_model_and_reasoning_flags():
     cells = bootstrap_enrich_ub.cells(_plan_args(
         *("--xs 33 --seeds 0 --cells exp5_en --enrich-batch 5 --enrich-max-previous-queries 50 "
           "--model qwen/qwen3.6-35b-a3b --compute-model qwen/qwen3.6-35b-a3b --agent-model qwen/qwen3.6-35b-a3b "
-          "--map-model qwen/qwen3.6-35b-a3b --provider parasail --disable-reasoning --run-prefix dq").split()))
+          "--map-model qwen/qwen3.6-35b-a3b --providers parasail,akashml,reka,venice --disable-reasoning --run-prefix dq").split()))
     assert len(cells) == 1
     c = cells[0]
     assert c.label == "dq_x33_exp5_en_s0" and c.expected_rows == 66
     ov = set(c.argv)
-    assert "inference.llm_provider_order=[parasail]" in ov
+    assert "inference.llm_provider_order=[parasail,akashml,reka,venice]" in ov
     assert "systems.retrieve.enrich_config.max_previous_queries=50" in ov
     assert "systems.retrieve.enrich_query_batch_size=5" in ov
     for agent in ("systems.retrieve", "systems.compute", "systems.retrieve.bootstrap_config", "systems.retrieve.enrich_config"):

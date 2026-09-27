@@ -52,8 +52,9 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     g.add_argument("--compute-model", default="openai/gpt-5.6-terra")
     g.add_argument("--agent-model", default="openai/gpt-5.6-terra", help="Bootstrap / Enrich agents' own model")
     g.add_argument("--map-model", default="openai/gpt-5.6-luna", help="semantic_map judge model")
-    g.add_argument("--provider", default=None,
-                   help="OpenRouter provider pin for every LLM call (inference.llm_provider_order), e.g. parasail")
+    g.add_argument("--provider", "--providers", dest="provider", default=None,
+                   help="OpenRouter provider pin for every LLM call (inference.llm_provider_order): a comma-separated "
+                        "ORDER of slugs, tried first-to-last, never anyone outside the list, e.g. parasail,akashml,reka,venice")
     g.add_argument("--disable-reasoning", action="store_true",
                    help="no thinking tokens on the search / compute / bootstrap / enrich agents' own steps "
                         "(the semantic_map judge already runs with reasoning disabled); Qwen3-style models only")
@@ -94,7 +95,8 @@ def cells(args: argparse.Namespace) -> list[Cell]:
     if not args.with_pdfs:
         system_overrides.append("benchmarks.pdf_dir=null")
     if args.provider:
-        system_overrides.append(f"inference.llm_provider_order=[{args.provider}]")
+        order = ",".join(p.strip() for p in args.provider.split(",") if p.strip())
+        system_overrides.append(f"inference.llm_provider_order=[{order}]")
     if args.disable_reasoning:
         system_overrides += [f"{agent}.disable_reasoning=true" for agent in (
             "systems.retrieve", "systems.compute", "systems.retrieve.bootstrap_config", "systems.retrieve.enrich_config")]
