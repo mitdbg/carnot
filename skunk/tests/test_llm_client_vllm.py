@@ -298,3 +298,30 @@ def test_retry_loop_sleeps_the_retry_after(monkeypatch, stub_server):
 
     assert backend._retry_call(attempt, "vllm", "loc/m") == "ok"
     assert calls["n"] == 2 and slept == [5.0]
+
+
+def _openrouter_402(reason: str, retry_after: str | None = "120"):
+    """A real OpenRouter SDK 402 as the API returns it, with the reason (and Retry-After) in the body's metadata."""
+    from openrouter.errors import PaymentRequiredResponseError, PaymentRequiredResponseErrorData
+
+    meta = {"reason": reason, "limit_source": "openrouter_in_flight_budget", "provider_name": None}
+    if retry_after is not None:
+        meta["headers"] = {"Retry-After": retry_after}
+    body = {"error": {"message": "This request would exceed your available credits given your current in-flight requests.",
+                      "code": 402, "metadata": meta}}
+    req = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    resp = httpx.Response(402, request=req, json=body)
+    data = PaymentRequiredResponseErrorData.model_validate(body)
+    return PaymentRequiredResponseError(data, resp, body=resp.text)
+
+
+def test_openrouter_inflight_402_is_retryable_with_its_retry_after():
+    """OpenRouter's in-flight-budget 402 is throttling (it clears as requests settle), so it retries and honours
+    the Retry-After it carries in the metadata; any other 402 (out of credits) stays permanent."""
+    from skunk.llm_client import _retry_after_s
+
+    e = _openrouter_402("in_flight_budget_exhausted")
+    assert _is_retryable(e)
+    assert _retry_after_s(e) == 120.0
+    assert not _is_retryable(_openrouter_402("insufficient_credits"))
+    assert _retry_after_s(_openrouter_402("in_flight_budget_exhausted", retry_after=None)) is None

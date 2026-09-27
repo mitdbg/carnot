@@ -92,6 +92,11 @@ def _is_retryable(e: BaseException) -> bool:
         OpenRouterError = ()  # type: ignore[assignment]
     if isinstance(e, OpenRouterError):
         code = getattr(e, "status_code", None)
+        if code == 402 and _OPENROUTER_INFLIGHT_REASON in str((_openrouter_error_metadata(e) or {}).get("reason", "")):
+            # OpenRouter's in-flight budget: the account's balance caps how much can be in flight at once
+            # across every process using the key; it clears as requests settle (Retry-After is set). A
+            # genuine out-of-credits 402 has a different reason and stays permanent.
+            return True
         return code == 429 or (code is not None and 500 <= code < 600)
     # openai SDK errors (the vllm path): `APIStatusError` carries the HTTP status;
     # `APIConnectionError` (which includes `APITimeoutError`) wraps httpx transport
@@ -119,6 +124,20 @@ def _is_retryable(e: BaseException) -> bool:
     )
 
     return isinstance(e, retryable)
+
+
+_OPENROUTER_INFLIGHT_REASON = "in_flight_budget_exhausted"
+
+
+def _openrouter_error_metadata(e: BaseException) -> dict | None:
+    """OpenRouter's error `metadata` dict (reason, provider, headers such as Retry-After) when the SDK
+    exception carries one; None otherwise. Never raises."""
+    try:
+        err = getattr(getattr(e, "data", None), "error", None)
+        meta = getattr(err, "metadata", None)
+        return dict(meta) if isinstance(meta, dict) else None
+    except Exception:  # noqa: BLE001 — diagnostics only
+        return None
 
 
 def _error_detail(e: BaseException) -> str:
@@ -183,12 +202,16 @@ def _retry_after_s(e: BaseException) -> float | None:
     HTTP-date forms. Never raises."""
     resp = getattr(e, "raw_response", None) or getattr(e, "response", None)
     headers = getattr(resp, "headers", None)
-    if not headers:
-        return None
-    try:
-        value = headers.get("retry-after") or headers.get("Retry-After")
-    except Exception:  # noqa: BLE001 — a headers object we do not understand is the same as no header
-        return None
+    value = None
+    if headers:
+        try:
+            value = headers.get("retry-after") or headers.get("Retry-After")
+        except Exception:  # noqa: BLE001 — a headers object we do not understand is the same as no header
+            value = None
+    if not value:
+        # OpenRouter also echoes the header inside the error body's metadata (its in-flight-budget 402 does)
+        meta_headers = (_openrouter_error_metadata(e) or {}).get("headers") or {}
+        value = meta_headers.get("Retry-After") or meta_headers.get("retry-after") if isinstance(meta_headers, dict) else None
     if not value:
         return None
     try:
