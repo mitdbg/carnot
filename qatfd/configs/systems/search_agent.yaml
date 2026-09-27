@@ -54,6 +54,9 @@ retrieve:
   # base collection plus the collections the Bootstrap / Enrich agents curated) and delete them after each Enrich
   # run; false = later search agents see and reuse earlier questions' trajectory working sets
   hide_and_clear_working_sets: true
+  # persist each search agent's docs_for_q* trajectory collection; false drops it as soon as the agent is built
+  # (nothing is ever written), so later search agents / the Enrich agent only ever see the curated collections
+  trajectory_working_sets: true
 
   ### Bootstrap Agent Config ###
   bootstrap_config:

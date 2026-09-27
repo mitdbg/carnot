@@ -49,7 +49,7 @@ variable "experiment_instance_type" {
 variable "experiment_max_nodes" {
   description = "Upper bound the cluster autoscaler may scale the experiment node group to."
   type        = number
-  default     = 4
+  default     = 8
 }
 
 variable "experiment_capacity_type" {

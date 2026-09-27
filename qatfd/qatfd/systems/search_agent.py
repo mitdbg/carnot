@@ -18,6 +18,7 @@ from collections import deque
 from jinja2 import Environment, StrictUndefined
 from threading import Lock
 
+from chromadb.errors import NotFoundError
 from skunk.common import ExecutionContext
 from skunk.config import AgentConfig, InferenceConfig
 # from skunk.agents.search_agent.search_agent import SearchAgent
@@ -42,6 +43,24 @@ _EN_PROMPTS = load_qatfd_prompts("enrich_agent")
 _WS_PROMPTS = load_qatfd_prompts("working_set")
 
 
+class _NullCollection:
+    """Stand-in for the search agent's trajectory collection when `trajectory_working_sets` is off: the agent's
+    result upserts and its action ledger go nowhere (`SearchAgent._handle_tool_call` / `_update_collection_actions`
+    only ever call `upsert`, `metadata` and `modify` on it)."""
+
+    name = "<no trajectory collection>"
+
+    @property
+    def metadata(self) -> dict:
+        return {}
+
+    def upsert(self, **_) -> None:
+        pass
+
+    def modify(self, **_) -> None:
+        pass
+
+
 class SearchAgentSystem(RetrieveComputeSystem):
     name = "search_agent"
 
@@ -64,6 +83,20 @@ class SearchAgentSystem(RetrieveComputeSystem):
         }
 
     def _build_search_agent(self, ctx: ExecutionContext, resources: BenchmarkResources, q: Question) -> SearchAgent:
+        agent = self._construct_search_agent(ctx, resources, q)
+        if not self.retrieve_config.trajectory_working_sets:
+            # the SearchAgent created its (still empty) docs_for_q* collection in __init__; drop it before any
+            # result is written so no later agent (or the EnrichAgent) ever sees this trajectory
+            name = agent._collection.name
+            try:
+                resources.chroma_client.delete_collection(name)
+            except NotFoundError:
+                pass
+            agent._collection = _NullCollection()  # type: ignore[assignment]
+            ctx.tracer.emit(id="trajectory_collection_dropped", kind="lifecycle", data={"collection": name})
+        return agent
+
+    def _construct_search_agent(self, ctx: ExecutionContext, resources: BenchmarkResources, q: Question) -> SearchAgent:
         self.retrieve_config: QATFDSearchAgentConfig
         additional_notes_template = _SA_PROMPTS["additional_notes"]
         additional_notes = _ENV.from_string(additional_notes_template).render(

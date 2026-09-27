@@ -92,13 +92,16 @@ pod:
 # 0.2 GB) plus every collection a cell creates, and it never frees a deleted collection's index, so a
 # bootstrap/enrich cell at X=10 can run chroma to 2-3x the corpus index. The runner's heap is the document
 # map plus whatever the httpx retention issue leaks between gc passes. A node is 384 GiB / 48 vCPU / 2.8 TB.
-#   chroma.limits.memory + runner.limits.memory ~= what one cell can take; parallelism / 4 nodes ~= cells per node
+#   chroma.limits.memory + runner.limits.memory ~= what one cell can take. The scheduler packs cells by REQUESTS,
+#   so requests per cell decide cells per node (r6id.12xlarge allocatable ~370Gi): keep chroma.requests +
+#   runner.requests above 370/(N+1) to cap a node at N cells, or a busy sweep over-packs and OOM-kills.
+#   parallelism is per release; anything the node group (terraform experiment_max_nodes) cannot hold just pends.
 benchmarks:
   officeqa:
-    parallelism: 16                       # 4 cells per node at these limits
+    parallelism: 30                       # two dev-set sweeps (5 cells x 3 seeds each) side by side on 8 nodes
     chroma:
-      requests: { cpu: "1", memory: 40Gi }
-      limits: { memory: 56Gi }
+      requests: { cpu: "1", memory: 64Gi } # 64 + 12 = 76Gi per cell -> 4 cells per node (5 would need 380Gi)
+      limits: { memory: 64Gi }
     runner:
       requests: { cpu: "3", memory: 12Gi }
       limits: { memory: 24Gi }            # ~48Gi if running without the gc backstop in qatfd/tools.py

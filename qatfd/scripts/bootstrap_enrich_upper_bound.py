@@ -69,7 +69,7 @@ from qatfd.benchmarks.base import Benchmark, BenchmarkResources
 from qatfd.config import ExperimentConfig, benchmark_config_factory, system_config_factory
 from qatfd.registry import build_benchmark
 from qatfd.runner import _RunCtx, _persist_run_config, _resolve_run_dir, _run_one, _select_questions
-from qatfd.systems.search_agent import SearchAgentSystem
+from qatfd.systems.search_agent import SearchAgentSystem, _NullCollection
 from qatfd.tools import ListCollectionsTool, is_managed_collection
 from qatfd.types import Question, Result, report_columns, result_to_row
 
@@ -107,27 +107,6 @@ class UpperBoundConfig:
 # ---------------------------------------------------------------------------
 # the system: a SearchAgentSystem whose search agents can run without a trajectory collection
 # ---------------------------------------------------------------------------
-
-class _NullCollection:
-    """Stand-in for the search agent's trajectory collection when trajectory working sets are off: the
-    agent's result upserts and its action ledger go nowhere (`SearchAgent._handle_tool_call` /
-    `_update_collection_actions` only ever call `upsert`, `metadata` and `modify` on it)."""
-
-    name = "<no trajectory collection>"
-
-    @property
-    def metadata(self) -> dict:
-        return {}
-
-    def upsert(self, **_) -> None:
-        pass
-
-    def modify(self, **_) -> None:
-        pass
-
-    def count(self) -> int:
-        return 0
-
 
 class UpperBoundSearchAgentSystem(SearchAgentSystem):
     """`SearchAgentSystem` with one extra switch: whether each search agent keeps its trajectory

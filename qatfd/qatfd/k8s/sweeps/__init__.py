@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
-from qatfd.k8s.sweeps import bootstrap_enrich_ub
+from qatfd.k8s.sweeps import bootstrap_enrich_dev, bootstrap_enrich_ub
 
 SWEEPS = {
     bootstrap_enrich_ub.NAME: bootstrap_enrich_ub,
+    bootstrap_enrich_dev.NAME: bootstrap_enrich_dev,
 }

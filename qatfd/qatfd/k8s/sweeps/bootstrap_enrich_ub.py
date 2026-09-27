@@ -17,6 +17,7 @@ import argparse
 
 from qatfd.k8s.benchmarks import benchmark_data
 from qatfd.k8s.cells import Cell
+from qatfd.k8s.sweeps._common import REASONING_AGENTS, add_model_arguments, model_overrides  # noqa: F401  (REASONING_AGENTS re-exported)
 
 NAME = "bootstrap_enrich_ub"
 # results/<benchmark>/<SYSTEM_DIR>/ — scripts/bootstrap_enrich_upper_bound.py's SYSTEM_DIR
@@ -48,18 +49,7 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     g.add_argument("--passes", type=int, default=2)
     g.add_argument("--enrich-batch", type=int, default=None, help="EnrichAgent cadence in questions; default X")
     g.add_argument("--qids", nargs="+", default=None, help="explicit qids (overrides X / seed; X is a label only)")
-    g.add_argument("--model", default="openai/gpt-5.6-luna", help="search agent model")
-    g.add_argument("--compute-model", default="openai/gpt-5.6-terra")
-    g.add_argument("--agent-model", default="openai/gpt-5.6-terra", help="Bootstrap / Enrich agents' own model")
-    g.add_argument("--map-model", default="openai/gpt-5.6-luna", help="semantic_map judge model")
-    g.add_argument("--provider", "--providers", dest="provider", default=None,
-                   help="OpenRouter provider pin for every LLM call (inference.llm_provider_order): a comma-separated "
-                        "ORDER of slugs, tried first-to-last, never anyone outside the list, e.g. parasail,akashml,reka,venice")
-    g.add_argument("--disable-reasoning", action="store_true",
-                   help="no thinking tokens on the search / compute / bootstrap / enrich agents' own steps "
-                        "(the semantic_map judge already runs with reasoning disabled); Qwen3-style models only")
-    g.add_argument("--enrich-max-previous-queries", type=int, default=None,
-                   help="EnrichAgent's query-workload window (enrich_config.max_previous_queries; config default 20)")
+    add_model_arguments(g)
     g.add_argument("--base-collection", default=None, help="corpus collection (default: the benchmark's v1 copy)")
     g.add_argument("--keep-collections", nargs="*", default=["officeqa-qwen-8b", "officeqa-qwen-8b-v1"])
     g.add_argument("--baseline-collection-off", default="true", choices=["true", "false"],
@@ -75,17 +65,12 @@ def cells(args: argparse.Namespace) -> list[Cell]:
     keep = ",".join(sorted(set([base_collection, *args.keep_collections])))
     system_overrides = [
         "systems=search_agent",
-        f"inference.llm_model={args.model}",
-        f"systems.compute.llm_model={args.compute_model}",
+        *model_overrides(args),
         "systems.retrieve.include_search_corpus=true",
         "systems.retrieve.include_grep_corpus=true",
         "systems.retrieve.include_semantic_filter=false",
         "systems.retrieve.id_tracking_off=false",
         "systems.retrieve.fetch_related_working_sets=true",
-        f"systems.retrieve.bootstrap_config.llm_model={args.agent_model}",
-        f"systems.retrieve.bootstrap_config.semantic_map_llm_model={args.map_model}",
-        f"systems.retrieve.enrich_config.llm_model={args.agent_model}",
-        f"systems.retrieve.enrich_config.semantic_map_llm_model={args.map_model}",
         f"benchmarks={args.benchmark}",
         f"benchmarks.collection_name={base_collection}",
         f"experiments.split={args.split}",
@@ -94,15 +79,6 @@ def cells(args: argparse.Namespace) -> list[Cell]:
     ]
     if not args.with_pdfs:
         system_overrides.append("benchmarks.pdf_dir=null")
-    if args.provider:
-        order = ",".join(p.strip() for p in args.provider.split(",") if p.strip())
-        system_overrides.append(f"inference.llm_provider_order=[{order}]")
-    if args.disable_reasoning:
-        system_overrides += [f"{agent}.disable_reasoning=true" for agent in (
-            "systems.retrieve", "systems.compute", "systems.retrieve.bootstrap_config", "systems.retrieve.enrich_config")]
-    if args.enrich_max_previous_queries is not None:
-        system_overrides.append(f"systems.retrieve.enrich_config.max_previous_queries={args.enrich_max_previous_queries}")
-
     out: list[Cell] = []
     for x in args.xs:
         for seed in args.seeds:

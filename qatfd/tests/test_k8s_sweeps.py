@@ -9,7 +9,7 @@ import pytest
 from qatfd.k8s import __main__ as cli
 from qatfd.k8s.benchmarks import benchmark_data
 from qatfd.k8s.cells import Cell
-from qatfd.k8s.sweeps import bootstrap_enrich_ub
+from qatfd.k8s.sweeps import bootstrap_enrich_dev, bootstrap_enrich_ub
 
 
 def _plan_args(*extra: str):
@@ -113,3 +113,51 @@ def test_model_and_reasoning_flags():
     for agent in ("systems.retrieve", "systems.compute", "systems.retrieve.bootstrap_config", "systems.retrieve.enrich_config"):
         assert f"{agent}.disable_reasoning=true" in ov
     assert sum(a.endswith("qwen/qwen3.6-35b-a3b") for a in c.argv) == 6  # search, compute, bootstrap, enrich, 2x map
+
+    # a subset keeps thinking on the agents left out (here: the compute agent)
+    c = bootstrap_enrich_ub.cells(_plan_args(*"--xs 1 --seeds 0 --cells exp1_baseline --disable-reasoning search bootstrap enrich".split()))[0]
+    ov = set(c.argv)
+    assert "systems.retrieve.disable_reasoning=true" in ov and "systems.retrieve.enrich_config.disable_reasoning=true" in ov
+    assert not any(a.startswith("systems.compute.disable_reasoning") for a in ov)
+    # and no flag at all emits nothing
+    c = bootstrap_enrich_ub.cells(_plan_args(*"--xs 1 --seeds 0 --cells exp1_baseline".split()))[0]
+    assert not any("disable_reasoning" in a for a in c.argv)
+
+
+def _dev_args(*extra: str):
+    import argparse
+    p = argparse.ArgumentParser()
+    bootstrap_enrich_dev.add_arguments(p)
+    return p.parse_args(list(extra))
+
+
+def test_dev_sweep_is_stock_runner_one_pass():
+    cells = bootstrap_enrich_dev.cells(_dev_args())
+    assert len(cells) == 15 and all(c.expected_rows == 33 for c in cells)
+    assert all(c.system_dir == "search_agent" and c.argv[:3] == ["python", "-m", "qatfd.runner"] for c in cells)
+    assert not any(a.startswith("+ub.") for c in cells for a in c.argv)  # no upper-bound driver, no passes
+    by_label = {c.label: c for c in cells}
+    bs = set(by_label["dev_exp3_bs_s1"].argv)
+    assert {"systems.retrieve.enrich_working_sets=before", "systems.retrieve.enrich_query_batch_size=5",
+            "systems.retrieve.trajectory_working_sets=false", "systems.retrieve.working_set_collection_off=false",
+            "systems.retrieve.hide_and_clear_working_sets=true", "experiments.shuffle_seed=1",
+            "experiments.run_mode=sequential", "experiments.split=dev", "experiments.run_name=dev_exp3_bs_s1"} <= bs
+    ws = set(by_label["dev_exp2_ws_s0"].argv)
+    assert "systems.retrieve.trajectory_working_sets=true" in ws and "systems.retrieve.enrich_working_sets=null" in ws
+    base = set(by_label["dev_exp1_baseline_s0"].argv)
+    assert "systems.retrieve.working_set_collection_off=true" in base
+
+
+def test_dev_sweep_model_knobs():
+    c = bootstrap_enrich_dev.cells(_dev_args(*"--seeds 0 --cells exp7_bs_en --enrich-batch 5 --enrich-max-previous-queries 50 "
+                                              "--model qwen/qwen3.6-35b-a3b --compute-model qwen/qwen3.6-35b-a3b "
+                                              "--agent-model qwen/qwen3.6-35b-a3b --map-model qwen/qwen3.6-35b-a3b "
+                                              "--providers parasail,akashml,reka,venice --disable-reasoning search bootstrap enrich "
+                                              "--run-prefix devq".split()))[0]
+    ov = set(c.argv)
+    assert c.label == "devq_exp7_bs_en_s0"
+    assert "inference.llm_provider_order=[parasail,akashml,reka,venice]" in ov
+    assert "systems.retrieve.enrich_config.max_previous_queries=50" in ov
+    assert "systems.retrieve.enrich_working_sets=both" in ov
+    assert "systems.retrieve.disable_reasoning=true" in ov and "systems.retrieve.enrich_config.disable_reasoning=true" in ov
+    assert not any(a.startswith("systems.compute.disable_reasoning") for a in ov)

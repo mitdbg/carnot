@@ -113,6 +113,10 @@ class QATFDSearchAgentConfig(SearchAgentConfig):
     enrich_query_batch_size: int | None = None
     # hide the non-bootstrap and non-enrich working sets from the SearchAgent and clear them after a bootstrap/enrich agent runs
     hide_and_clear_working_sets: bool = True
+    # persist each search agent's trajectory (its docs_for_q* collection) on the server. false drops the collection
+    # right after the agent is built and swallows its writes, so no later search agent or EnrichAgent ever sees it
+    # (hide_and_clear only hides trajectories from the prompt and deletes them after an Enrich run)
+    trajectory_working_sets: bool = True
     # configuration for a BootstrapAgent to create initial working sets
     bootstrap_config: BootstrapConfig
     # configuration for an EnrichAgent to enrich existing working sets
