@@ -60,6 +60,8 @@ retrieve:
     agent_id: ${systems.name}-bootstrap
     # model for the bootstrap agent's own steps; null => inference.llm_model
     llm_model: null
+    # no thinking tokens on the agent's own steps (OpenRouter reasoning effort "none"); only for models that can run without thinking, e.g. Qwen3
+    disable_reasoning: false
     max_steps: 40
     semantic_map_max_workers: 16
     semantic_map_max_candidate_chunks: 10000
@@ -88,6 +90,8 @@ retrieve:
     agent_id: ${systems.name}-enrich
     # model for the enrich agent's own steps; null => inference.llm_model
     llm_model: null
+    # no thinking tokens on the agent's own steps (OpenRouter reasoning effort "none"); only for models that can run without thinking, e.g. Qwen3
+    disable_reasoning: false
     max_steps: 20
     # the number of most recent queries (handled by the system) shown to the agent as the query workload
     max_previous_queries: 20

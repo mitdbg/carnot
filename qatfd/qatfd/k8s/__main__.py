@@ -23,7 +23,8 @@ CHART_DIR = REPO_ROOT / "deploy_exp" / "helm" / "experiments"
 TERRAFORM_DIR = REPO_ROOT / "deploy_exp" / "terraform"
 RESULTS_DIR = REPO_ROOT / "qatfd" / "results"
 STATE_DIR = RESULTS_DIR / ".k8s"          # rendered values files + pulled status json, per release
-SWEEP_LABEL = "carnot.io/sweep"           # pod label the chart sets (templates/_helpers.tpl)
+SWEEP_LABEL = "qatfd.io/sweep"             # pod label the chart sets (templates/_helpers.tpl)
+SERVICE_ACCOUNT = os.environ.get("QATFD_K8S_SERVICE_ACCOUNT", "experiment-runner")  # terraform var runner_service_account
 _RUN_DIR_RE = re.compile(r"_(\d{8})_(\d{6})$")
 
 
@@ -89,6 +90,28 @@ def _role_arn(args: argparse.Namespace) -> str:
         sys.exit(f"--role-arn not given and `terraform output runner_role_arn` failed ({e}); pass it explicitly")
 
 
+def _ensure_service_account(args: argparse.Namespace, role_arn: str) -> None:
+    """Apply the shared runner ServiceAccount (IRSA-annotated) outside any Helm release. Idempotent: every
+    submit re-applies the same object, so no release owns it and releases never collide on it."""
+    manifest = {
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+            "name": SERVICE_ACCOUNT,
+            "namespace": args.namespace,
+            "annotations": {"eks.amazonaws.com/role-arn": role_arn},
+            "labels": {"app.kubernetes.io/name": "experiments", "app.kubernetes.io/managed-by": "qatfd.k8s"},
+        },
+    }
+    ns = subprocess.run(["kubectl", "get", "namespace", args.namespace], capture_output=True, text=True)
+    if ns.returncode != 0:
+        _run(["kubectl", "create", "namespace", args.namespace])
+    r = subprocess.run(["kubectl", "apply", "-f", "-"], input=yaml.safe_dump(manifest), capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"could not apply ServiceAccount {SERVICE_ACCOUNT}: {r.stderr.strip()}")
+    _log(f"{r.stdout.strip()} (role {role_arn})")
+
+
 def cmd_submit(args: argparse.Namespace) -> int:
     cells = _build_cells(args)
     todo = _print_plan(cells, _mark_complete(cells, args))
@@ -101,14 +124,12 @@ def cmd_submit(args: argparse.Namespace) -> int:
     values: dict = {
         "benchmark": benchmarks.pop(),
         "image": {"tag": args.image_tag or "latest"},
-        "serviceAccount": {"create": not args.no_sa_create},
+        "serviceAccount": {"create": False, "name": SERVICE_ACCOUNT},
         "s3": {"dataBucket": args.data_bucket, "resultsBucket": args.results_bucket, "resultsPrefix": args.results_prefix},
         "cells": [c.to_values() for c in todo],
     }
     if args.parallelism:
         values["job"] = {"parallelism": args.parallelism}
-    if not args.dry_run:
-        values["serviceAccount"]["roleArn"] = _role_arn(args)
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     values_path = STATE_DIR / f"{args.release}.values.yaml"
@@ -121,6 +142,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         return 0
     if not args.image_tag:
         sys.exit("--image-tag is required (the git sha build_push.sh pushed; `latest` is a foot-gun for reproducibility)")
+    _ensure_service_account(args, _role_arn(args))
     _log(" ".join(helm))
     r = _run(helm, check=False)
     print(r.stdout)
@@ -209,6 +231,15 @@ def _status_json(args: argparse.Namespace) -> dict[int, dict]:
     return out
 
 
+def _index_set(spec: str) -> set[int]:
+    """Parse a Job's completedIndexes/failedIndexes string ("0-6,8,12-14") into a set of indices."""
+    out: set[int] = set()
+    for part in filter(None, spec.split(",")):
+        lo, _, hi = part.partition("-")
+        out.update(range(int(lo), int(hi or lo) + 1))
+    return out
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     cells = _release_cells(args)
     _log(f"watching release {args.release}: {len(cells)} cell(s); results -> {RESULTS_DIR}")
@@ -226,13 +257,23 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
         st = job.get("status", {})
         conds = {c["type"]: c["status"] for c in st.get("conditions", [])}
+        completed = _index_set(st.get("completedIndexes", ""))
+        failed_idx = _index_set(st.get("failedIndexes", ""))
         print(f"\n== {args.release}: active={st.get('active', 0)} succeeded={st.get('succeeded', 0)} "
               f"failed={st.get('failed', 0)} of {job['spec']['completions']}  ({datetime.datetime.now():%H:%M:%S})")
         print(f"  {'idx':>3} {'label':40s} {'stage':22s} {'node':28s} {'rst':>3} {'rows':>9} {'elapsed':>8}")
         for i, c in enumerate(cells):
             pod = newest.get(i)
-            stage, restarts = _pod_stage(pod) if pod else ("not created", 0)
             node = (pod or {}).get("spec", {}).get("nodeName", "") or ""
+            if pod:
+                stage, restarts = _pod_stage(pod)
+            elif i in completed or i in failed_idx:
+                # the pod object is gone: completed pods are garbage-collected when the autoscaler removes
+                # their node. The Job's index sets and the status json still know what happened.
+                stage, restarts = ("done (pod gone)" if i in completed else "FAILED (pod gone)"), 0
+                node = status.get(i, {}).get("node", "") or ""
+            else:
+                stage, restarts = "pending", 0
             _, rows = _local_rows(c)
             el = status.get(i, {}).get("elapsed_s")
             elapsed = f"{el // 60}m" if isinstance(el, int) else ""
@@ -263,7 +304,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--namespace", default=os.environ.get("QATFD_K8S_NAMESPACE", "experiments"))
     p.add_argument("--data-bucket", default="carnot-research")
-    p.add_argument("--results-bucket", default="carnot-research-experiments")
+    p.add_argument("--results-bucket", default="qatfd-research-experiments")
     p.add_argument("--results-prefix", default="results")
     p.add_argument("--jobs-prefix", default="jobs")
 
@@ -298,7 +339,6 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--image-tag", help="image tag build_push.sh pushed (git sha)")
     sp.add_argument("--role-arn", help="runner IRSA role ARN (default: terraform output runner_role_arn)")
     sp.add_argument("--parallelism", type=int, help="override the benchmark profile's parallelism")
-    sp.add_argument("--no-sa-create", action="store_true", help="another release in the namespace owns the ServiceAccount")
     sp.add_argument("--dry-run", action="store_true", help="write the values file and print the helm command only")
     sp.add_argument("--watch", action="store_true", help="then watch the job and pull results as they land")
     sp.add_argument("--interval", type=int, default=60)

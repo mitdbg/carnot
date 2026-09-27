@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import json
 import pathlib
+import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -39,14 +41,17 @@ from urllib.parse import parse_qs, urlparse
 csv.field_size_limit(10**9)
 
 _APP_HTML = pathlib.Path(__file__).parent / "app.html"
+# run dirs are `<label>_<YYYYmmdd>_<HHMMSS>`; the stamp orders the run list newest-first
+_RUN_STAMP_RE = re.compile(r"_(\d{8}_\d{6})$")
 
 
 # ── Discovery + parsing helpers ─────────────────────────────────────────────
 
 def _find_runs(root: pathlib.Path) -> list[str]:
     """Run directories under `root` that hold per-question traces or a report.csv,
-    returned as paths relative to `root`, newest first (dir names are
-    timestamp-suffixed, so reverse-sorted == newest).
+    returned as paths relative to `root`, newest first: by the `_YYYYmmdd_HHMMSS` suffix of the run
+    dir name when it has one (falling back to the dir's mtime), NOT by path, so a run pulled into
+    one system dir is not buried under every alphabetically-later system dir.
 
     Discovers both layouts: the flat `eval/traces/<run>/` and the qatfd
     `results/<benchmark>/<system>/<run>/` hierarchy. A directory qualifies as a run when
@@ -73,7 +78,18 @@ def _find_runs(root: pathlib.Path) -> list[str]:
         _walk(root)
     except FileNotFoundError:
         pass
-    return sorted(runs, reverse=True)
+
+    def _stamp(rel: str) -> tuple[str, str]:
+        m = _RUN_STAMP_RE.search(pathlib.PurePosixPath(rel).name)
+        if m:
+            return (m.group(1), rel)
+        try:
+            mtime = (root / rel).stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        return (datetime.datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S"), rel)
+
+    return sorted(runs, key=_stamp, reverse=True)
 
 
 def _read_report(run_dir: pathlib.Path) -> list[dict]:

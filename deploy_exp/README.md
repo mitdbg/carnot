@@ -80,16 +80,19 @@ One-time per namespace, then the smoke test:
 ```bash
 kubectl create namespace experiments
 kubectl -n experiments create secret generic llm-keys --from-literal=OPENROUTER_API_KEY=sk-or-...
+# the runner ServiceAccount lives OUTSIDE any Helm release (releases share it, and Helm refuses to install a
+# release whose manifest contains an object another release owns). `python -m qatfd.k8s submit` applies this
+# same object before every install, so this step is only needed for hand-run helm installs:
+kubectl -n experiments create serviceaccount experiment-runner --dry-run=client -o yaml \
+  | kubectl annotate --local -f - eks.amazonaws.com/role-arn=$(cd deploy_exp/terraform && terraform output -raw runner_role_arn) -o yaml \
+  | kubectl apply -f -
 helm upgrade --install smoke deploy_exp/helm/experiments -n experiments \
     -f deploy_exp/helm/experiments/values-smoke.yaml \
-    --set serviceAccount.roleArn=$(cd deploy_exp/terraform && terraform output -raw runner_role_arn) \
     --set image.tag=<git sha from build_push.sh>
 kubectl -n experiments get pods -w        # Pending until the autoscaler adds an r6id node (~3 min), then Init -> Running
 ```
 
-The ServiceAccount is created by the first release in the namespace; later releases in the same
-namespace set `serviceAccount.create=false`. `values.yaml` documents every knob and the cell
-schema.
+`values.yaml` documents every knob and the cell schema.
 
 Real sweeps are not hand-written values files: `python -m qatfd.k8s` (run from `qatfd/`, with
 aws, helm and kubectl on PATH) generates the cells from a sweep module under

@@ -234,11 +234,11 @@ resource "aws_eks_node_group" "experiment" {
   tags = merge(local.common_tags, {
     "k8s.io/cluster-autoscaler/${var.cluster_name}" = "owned"
     "k8s.io/cluster-autoscaler/enabled"             = "true"
-    # Scale-from-zero hints: with no live node to inspect, the autoscaler builds a template node
-    # from these tags (it also reads managed node group labels/taints via eks:DescribeNodegroup,
-    # so these are belt-and-braces).
+    # Scale-from-zero hints (documentation here; the copies that matter are on the ASG, see
+    # aws_autoscaling_group_tag.experiment below: EKS does not propagate node group tags to the ASG).
     "k8s.io/cluster-autoscaler/node-template/label/${local.workload_label}" = local.workload_value
     "k8s.io/cluster-autoscaler/node-template/taint/${local.workload_label}" = "${local.workload_value}:NoSchedule"
+    "k8s.io/cluster-autoscaler/node-template/resources/ephemeral-storage"   = local.experiment_ephemeral_storage
   })
 
   lifecycle {
@@ -250,4 +250,33 @@ resource "aws_eks_node_group" "experiment" {
     aws_iam_role_policy_attachment.node_cni,
     aws_iam_role_policy_attachment.node_ecr,
   ]
+}
+
+# The autoscaler builds its scale-from-zero template node for an empty group from the ASG's
+# `k8s.io/cluster-autoscaler/node-template/*` tags (labels and taints it can also read through
+# eks:DescribeNodegroup; resources it cannot). EKS does not copy node group tags onto the ASG it
+# manages, so they are set on the ASG directly here. Without the ephemeral-storage one the template
+# node advertises no disk, every pod that requests ephemeral-storage is "unschedulable", and the
+# group never leaves zero (2026-09-26: the first smoke test sat Pending on exactly this).
+locals {
+  # what a node actually has under kubelet: the 2 x 1425 GB instance-store RAID0, minus filesystem and
+  # kubelet reserves. Only has to admit the pods' requests; the live node reports its true allocatable.
+  experiment_ephemeral_storage = "2500Gi"
+  experiment_asg_tags = {
+    "k8s.io/cluster-autoscaler/node-template/label/${local.workload_label}" = local.workload_value
+    "k8s.io/cluster-autoscaler/node-template/taint/${local.workload_label}" = "${local.workload_value}:NoSchedule"
+    "k8s.io/cluster-autoscaler/node-template/resources/ephemeral-storage"   = local.experiment_ephemeral_storage
+  }
+}
+
+resource "aws_autoscaling_group_tag" "experiment" {
+  for_each = local.experiment_asg_tags
+
+  autoscaling_group_name = aws_eks_node_group.experiment.resources[0].autoscaling_groups[0].name
+
+  tag {
+    key                 = each.key
+    value               = each.value
+    propagate_at_launch = false
+  }
 }

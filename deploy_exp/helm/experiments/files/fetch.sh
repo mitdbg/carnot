@@ -12,8 +12,21 @@ echo "[fetch] cell $JOB_COMPLETION_INDEX ($LABEL): store s3://$DATA_BUCKET/$STOR
 aws configure set default.s3.max_concurrent_requests "${MAX_CONCURRENT_REQUESTS:-64}"
 aws configure set default.s3.max_queue_size 10000
 
+# Transient "Could not connect to the endpoint URL" errors happen when the node's inbound bandwidth is
+# saturated by neighbouring pods' pulls. sync/cp are idempotent, so retry the whole command with a pause.
+retry() {  # retry <cmd...>
+    local attempt
+    for attempt in $(seq 1 "${FETCH_ATTEMPTS:-6}"); do
+        "$@" && return 0
+        echo "[fetch] attempt $attempt/${FETCH_ATTEMPTS:-6} failed (exit $?): ${*:1:3} ...; retrying in $((attempt * 20))s" >&2
+        sleep $((attempt * 20))
+    done
+    echo "[fetch] giving up: $*" >&2
+    return 1
+}
+
 t0=$(date +%s)
-aws s3 sync "s3://$DATA_BUCKET/${STORE_PREFIX%/}/" /data/chromadb --only-show-errors
+retry aws s3 sync "s3://$DATA_BUCKET/${STORE_PREFIX%/}/" /data/chromadb --only-show-errors
 echo "[fetch] store done in $(( $(date +%s) - t0 ))s: $(du -sh /data/chromadb | cut -f1)"
 
 while IFS=$'\t' read -r src dest include exclude; do
@@ -24,10 +37,10 @@ while IFS=$'\t' read -r src dest include exclude; do
         [[ -z "$include" ]] || filters+=(--exclude "*" --include "$include")
         [[ -z "$exclude" ]] || filters+=(--exclude "$exclude")
         mkdir -p "/data/benchmarks/$dest"
-        aws s3 sync "s3://$DATA_BUCKET/$src" "/data/benchmarks/${dest%/}/" --only-show-errors "${filters[@]}"
+        retry aws s3 sync "s3://$DATA_BUCKET/$src" "/data/benchmarks/${dest%/}/" --only-show-errors "${filters[@]}"
     else
         mkdir -p "$(dirname "/data/benchmarks/$dest")"
-        aws s3 cp "s3://$DATA_BUCKET/$src" "/data/benchmarks/$dest" --only-show-errors
+        retry aws s3 cp "s3://$DATA_BUCKET/$src" "/data/benchmarks/$dest" --only-show-errors
     fi
     echo "[fetch] $src -> /data/benchmarks/$dest"
 done < <($CELL --data)

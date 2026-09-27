@@ -28,11 +28,23 @@ print(json.dumps({
     "elapsed_s": int(os.environ["ELAPSED"]),
 }, indent=1))
 PY
-    aws s3 cp /tmp/status.json "$STATUS_URI" --only-show-errors || true
+    aws s3 cp /tmp/status.json "$STATUS_URI" --only-show-errors \
+        || { sleep 20; aws s3 cp /tmp/status.json "$STATUS_URI" --only-show-errors; } || true
 }
 export RELEASE_NAME LABEL NODE ELAPSED=0 STARTED="$started"
 
 sync_results() { aws s3 sync /results "$RESULTS_URI" --only-show-errors || echo "[run] WARN: results sync failed"; }
+# the last sync must not be lost to a transient network error (neighbouring pods' pulls saturate the node)
+final_sync() {
+    local attempt
+    for attempt in 1 2 3 4 5 6; do
+        aws s3 sync /results "$RESULTS_URI" --only-show-errors && return 0
+        echo "[run] WARN: final results sync attempt $attempt failed; retrying in $((attempt * 20))s"
+        sleep $((attempt * 20))
+    done
+    echo "[run] ERROR: final results sync failed; results remain on the pod's /results only"
+    return 1
+}
 
 echo "[run] cell $JOB_COMPLETION_INDEX ($LABEL) on $NODE"
 status starting 0
@@ -61,6 +73,6 @@ kill "$SYNC_PID" 2>/dev/null; wait "$SYNC_PID" 2>/dev/null
 
 ELAPSED=$(( $(date +%s) - t0 ))
 echo "[run] cell exited with $rc after ${ELAPSED}s; final results sync"
-sync_results
+final_sync || { [[ $rc -eq 0 ]] && rc=75; }   # EX_TEMPFAIL: the cell ran but its results did not land
 if [[ $rc -eq 0 ]]; then status done 0; else status failed "$rc"; fi
 exit "$rc"

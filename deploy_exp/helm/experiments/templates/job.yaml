@@ -41,6 +41,12 @@ spec:
         cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
     spec:
       restartPolicy: Never
+      # Resolve names through the node's resolver (the VPC resolver, link-local, with its own traffic
+      # allowance) instead of CoreDNS on the system node. Cells only talk to 127.0.0.1 (chroma) and public
+      # endpoints (S3/STS/OpenRouter); under heavy S3 pulls the node's inbound bandwidth allowance is
+      # saturated and the small DNS replies from CoreDNS were being dropped -> "Could not connect to the
+      # endpoint URL". Also avoids the ndots:5 search-domain fan-out on every lookup.
+      dnsPolicy: Default
       serviceAccountName: {{ .Values.serviceAccount.name }}
       terminationGracePeriodSeconds: {{ .Values.pod.terminationGracePeriodSeconds }}
       nodeSelector:

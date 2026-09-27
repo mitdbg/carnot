@@ -94,6 +94,11 @@ class AgentConfig:
     temperature: float = 1.0
     # reasoning effort for the agent's model; if None, falls back to InferenceConfig.effort
     effort: Effort | None = None
+    # Ask the provider for NO thinking tokens at all on the agent's own steps (OpenRouter
+    # `reasoning={"effort": "none"}`), overriding `effort`. `effort="off"` only maps to the cheapest
+    # reasoning tier because some endpoints mandate reasoning; those endpoints (e.g. Gemini 3) reject
+    # this with a 400, so only enable it for models that can run without thinking (Qwen3-style).
+    disable_reasoning: bool = False
     # Per-step generation caps, threaded to `LLMClient.acall()`.
     # Both None → provider defaults (uncapped output, no wall-clock timeout),
     # preserving behaviour for every agent that doesn't opt in. `SearchAgent` sets

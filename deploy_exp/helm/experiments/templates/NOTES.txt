@@ -1,15 +1,20 @@
 Sweep "{{ .Release.Name }}": {{ len .Values.cells }} cell(s), up to {{ min (.Values.job.parallelism | default (index .Values.benchmarks .Values.benchmark).parallelism | int) (len .Values.cells) }} at once ({{ .Values.benchmark }} sizing profile), in namespace {{ .Release.Namespace }}.
 
   kubectl -n {{ .Release.Namespace }} get job {{ .Release.Name }}                      # succeeded / failed / active counts
-  kubectl -n {{ .Release.Namespace }} get pods -l carnot.io/sweep={{ .Release.Name }} -o wide   # one pod per cell (index in the name)
-  kubectl -n {{ .Release.Namespace }} logs -l carnot.io/sweep={{ .Release.Name }} -c runner -f --max-log-requests 64
+  kubectl -n {{ .Release.Namespace }} get pods -l qatfd.io/sweep={{ .Release.Name }} -o wide   # one pod per cell (index in the name)
+  kubectl -n {{ .Release.Namespace }} logs -l qatfd.io/sweep={{ .Release.Name }} -c runner -f --max-log-requests 64
   kubectl -n {{ .Release.Namespace }} logs job/{{ .Release.Name }} -c fetch-data          # if a pod is stuck in Init
   aws s3 ls s3://{{ .Values.s3.resultsBucket }}/{{ .Values.s3.jobsPrefix }}/{{ .Release.Name }}/   # per-cell status json
   aws s3 sync s3://{{ .Values.s3.resultsBucket }}/{{ .Values.s3.resultsPrefix }}/ qatfd/results/   # pull run dirs back
 
-{{- if not .Values.serviceAccount.roleArn }}
+{{- if and .Values.serviceAccount.create (not .Values.serviceAccount.roleArn) }}
 
 WARNING: serviceAccount.roleArn is empty; pods cannot reach S3. Set it to the terraform output runner_role_arn.
+{{- end }}
+{{- if not .Values.serviceAccount.create }}
+
+ServiceAccount {{ .Values.serviceAccount.name }} is NOT managed by this release: `python -m qatfd.k8s submit`
+applies it before installing (or apply it once by hand, see deploy_exp/README.md).
 {{- end }}
 {{- if .Values.secrets.llmSecretName }}
 

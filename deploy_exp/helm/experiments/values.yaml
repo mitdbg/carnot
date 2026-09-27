@@ -19,10 +19,13 @@ cluster:
   nodeLabelValue: experiments
 
 serviceAccount:
-  # create the ServiceAccount in this release (one release per namespace should own it; others set false)
-  create: true
+  # The ServiceAccount is shared by every release in the namespace, so no release should own it: Helm refuses
+  # to install a release whose manifest contains an object another release created. `python -m qatfd.k8s
+  # submit` applies it with kubectl (idempotent, annotated with the IRSA role) before each install; see
+  # deploy_exp/README.md for the one-off kubectl equivalent. create=true is only for a single hand-run release.
+  create: false
   name: experiment-runner                    # terraform var runner_service_account
-  # terraform output runner_role_arn; the SA is created by this chart and bound to the role by this annotation
+  # terraform output runner_role_arn; only used when create=true
   roleArn: ""
 
 s3:

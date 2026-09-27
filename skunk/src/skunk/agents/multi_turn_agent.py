@@ -606,6 +606,7 @@ class MultiTurnAgent(ABC):
             model=self._resolve_model(ctx),
             temperature=self.config.temperature,
             effort=self._resolve_effort(ctx),
+            disable_reasoning=self.config.disable_reasoning,
             call_site=self.config.name,
             max_output_tokens=self.config.max_output_tokens,
             timeout_s=self.config.request_timeout_s,

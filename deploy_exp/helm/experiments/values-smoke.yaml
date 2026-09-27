@@ -1,8 +1,7 @@
 # Smoke test: one officeqa dev question through the stock runner, sequential, base+v1 store, no PDFs.
+# The ServiceAccount must already exist in the namespace (deploy_exp/README.md, "one-time per namespace").
 #   helm upgrade --install smoke deploy_exp/helm/experiments -n experiments --create-namespace \
-#       -f deploy_exp/helm/experiments/values-smoke.yaml \
-#       --set serviceAccount.roleArn=$(cd deploy_exp/terraform && terraform output -raw runner_role_arn) \
-#       --set image.tag=<git sha>
+#       -f deploy_exp/helm/experiments/values-smoke.yaml --set image.tag=<git sha>
 benchmark: officeqa
 job:
   parallelism: 1

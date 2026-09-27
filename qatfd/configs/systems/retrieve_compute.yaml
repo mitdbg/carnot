@@ -2,6 +2,8 @@ retrieve:
   name: ${systems.name}
   # stable usage-attribution key for the system's retrieval agent (skunk MultiTurnAgent.agent_id)
   agent_id: ${systems.name}-retrieve
+  # no thinking tokens on the agent's own steps (OpenRouter reasoning effort "none"); only for models that can run without thinking, e.g. Qwen3
+  disable_reasoning: false
 
 compute:
   name: ${systems.name}
@@ -9,3 +11,5 @@ compute:
   agent_id: ${systems.name}-compute
   # model for the compute agent's steps; null => inference.llm_model
   llm_model: null
+  # no thinking tokens on the agent's own steps (OpenRouter reasoning effort "none"); only for models that can run without thinking, e.g. Qwen3
+  disable_reasoning: false

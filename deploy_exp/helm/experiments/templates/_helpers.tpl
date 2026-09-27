@@ -21,6 +21,11 @@ qatfd.io/sweep: {{ .Release.Name }}
   value: {{ .Values.s3.region | quote }}
 - name: AWS_DEFAULT_REGION
   value: {{ .Values.s3.region | quote }}
+# standard retry mode retries connection errors with exponential backoff (legacy gives up after 5 fast tries)
+- name: AWS_RETRY_MODE
+  value: standard
+- name: AWS_MAX_ATTEMPTS
+  value: "10"
 - name: DATA_BUCKET
   value: {{ .Values.s3.dataBucket | quote }}
 - name: RESULTS_BUCKET
