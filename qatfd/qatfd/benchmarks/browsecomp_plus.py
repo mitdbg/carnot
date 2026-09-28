@@ -108,7 +108,12 @@ class BrowseCompPlusBenchmark(Benchmark):
 
     async def score(self, question: Question, predicted: str, ctx: ExecutionContext) -> dict:
         return await judge_single_nugget(
-            ctx, question=question.text, gold=question.gold, predicted=predicted, model=self.config.judge_model
+            ctx,
+            question=question.text,
+            gold=question.gold,
+            predicted=predicted,
+            model=self.config.judge_model,
+            provider_order=self.config.judge_provider_order,
         )
 
     def recall_metrics(self, retrieved: list[str] | None, question: Question) -> dict[str, float]:

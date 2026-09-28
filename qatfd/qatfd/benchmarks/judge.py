@@ -49,7 +49,13 @@ def _parse_yes_no(text: str) -> bool:
 
 
 async def judge_single_nugget(
-    ctx: ExecutionContext, *, question: str, gold: str, predicted: str, model: str, usage_key: str | None = None,
+    ctx: ExecutionContext, *,
+    question: str,
+    gold: str,
+    predicted: str,
+    model: str,
+    provider_order: list[str] | None = None,
+    usage_key: str | None = None,
     timeout_s: float | None = JUDGE_TIMEOUT_S,
 ) -> dict:
     user = f"Question:\n{question}\n\nGold answer:\n{gold}\n\nPredicted answer:\n{predicted or '(no answer)'}"
@@ -62,6 +68,7 @@ async def judge_single_nugget(
         temperature=0.0,
         model=model,
         call_site="bcp_judge",
+        provider_order=provider_order,
         max_output_tokens=_JUDGE_MAX_OUTPUT_TOKENS,
         timeout_s=timeout_s,
         usage_key=usage_key if usage_key is not None else str(_JUDGE_UUID),
@@ -132,6 +139,7 @@ async def judge_nugget_recall(
     model: str,
     judge_system: str,
     partial_credit: float = 0.0,
+    provider_order: list[str] | None = None,
     usage_key: str | None = None,
     timeout_s: float | None = JUDGE_TIMEOUT_S,
 ) -> dict:
@@ -161,6 +169,7 @@ async def judge_nugget_recall(
         temperature=0.0,
         model=model,
         call_site="biogen_nugget_judge",
+        provider_order=provider_order,
         usage_key=usage_key if usage_key is not None else str(_JUDGE_UUID),
         timeout_s=timeout_s,
     )

@@ -218,6 +218,7 @@ class TrecBiogenBenchmark(Benchmark):
             nuggets=question.meta.get("nuggets", []),
             predicted=predicted,
             model=self.config.judge_model,
+            provider_order=self.config.judge_provider_order,
             judge_system="You are a careful biomedical answer-evaluation judge.",
             partial_credit=self.config.partial_credit,
         )

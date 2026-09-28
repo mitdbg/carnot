@@ -11,6 +11,7 @@ splits_path: browsecomp-plus/browsecomp_plus_splits.json
 bcp_questions: browsecomp-plus/browsecomp_plus_decrypted.jsonl
 bcp_metadata_glob: browsecomp-plus/browsecomp-plus-element-embeddings/metadata_rank*.json
 judge_model: null
+judge_provider_order: null
 codex_config_toml: browsecomp-plus/codex/config.toml
 codex_agents_md: browsecomp-plus/codex/AGENTS.md
 codex_answer_schema_file: browsecomp-plus/answer_schema.json

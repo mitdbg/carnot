@@ -251,6 +251,7 @@ class OfficeQASynthConfig(OfficeQAConfig):
     # llm used by the nugget-completion judge: a synthetic answer is a LIST of nugget strings (often several,
     # often short sentences), so the score is nugget recall (KARL-style), not the officeqa exact-answer scorer.
     judge_model: str
+    judge_provider_order: list[str] | None = None
     # weight given to a `partial_support` nugget in the recall score (full support = 1.0).
     partial_credit: float = 0.0
     # wall-clock cap (s) on one judge request; a request the provider never answers otherwise hangs until the
@@ -270,6 +271,7 @@ class BrowseCompPlusConfig(BenchmarkConfig):
     bcp_metadata_glob: str
     # the llm to use for judging system outputs on BrowseComp-Plus
     judge_model: str
+    judge_provider_order: list[str] | None = None
 
 
 @dataclass
@@ -277,13 +279,14 @@ class TrecBiogenConfig(BenchmarkConfig):
     # 2025 BioGen Task A JSON: 40 questions + expert reference answers w/cited PMIDs. Task A's
     # expert answers are the 2024-edition answers re-released against the 2025 corpus.
     task_a_path: str
-    # the llm used to judge nugget-completion (gold nuggets vs the system answer, KARL D.1 prompt)
-    judge_model: str
     # JSON of official gold nuggets keyed by qa_id (organizer/BioACE `baseline_labels.json`: a
     # list of {meta_data.qa_id, answer:[{nuggets:[...]}]}, flattened per question).
     # NOTE: the official nuggets are finer-grained (~24.6/q) than KARL's consolidated set (~7.1/q),
     # so the absolute nugget completion number is NOT directly comparable to KARL's reported 85.0.
     nuggets_path: str
+    # the llm used to judge nugget-completion (gold nuggets vs the system answer, KARL D.1 prompt)
+    judge_model: str
+    judge_provider_order: list[str] | None = None
     # weight given to a `partial_support` nugget in the recall score (full support = 1.0).
     partial_credit: float = 0.0
     # If >1, the 26.8M-abstract corpus is split across N per-rank Chroma collections named
@@ -311,6 +314,7 @@ class QampariConfig(BenchmarkConfig):
     # text + article title are served from the Chroma collection at eval time (the full ~25.9M-chunk
     # corpus is too large for an in-RAM doc map), so no metadata-glob config is needed.
     judge_model: str
+    judge_provider_order: list[str] | None = None
     # dev JSONL: 50 questions sampled (seed 0) from QAMPARI's train_data — DISJOINT from the test set
     # (which is the full KARL 1000, so dev never leaks into test). Loaded ALONGSIDE questions_path so
     # experiments.split=dev resolves with no per-run override; both splits share the one Wikipedia
@@ -331,6 +335,7 @@ class FinanceBenchConfig(BenchmarkConfig):
     fb_metadata_glob: str
     # the llm used to judge answer correctness (single-nugget YES/NO judge, KARL-style; see judge.py).
     judge_model: str
+    judge_provider_order: list[str] | None = None
 
 
 @dataclass
@@ -338,6 +343,7 @@ class FreshstackConfig(BenchmarkConfig):
     # the llm used by the nugget-completion judge (each gold nugget is one GPT-4o decompositional
     # fact; the answer is graded by nugget recall, mirroring KARL's nugget-based completion).
     judge_model: str
+    judge_provider_order: list[str] | None = None
     # FreshStack topic = which (corpus, queries) pair to run. Each topic has its OWN corpus and so
     # its OWN Chroma collection (unlike QAMPARI's shared index): `langchain` is KARL's FreshStack and
     # the held-out TEST set (203 q / 49,514 docs); `laravel` is the closest-sized DEV set (184 q /

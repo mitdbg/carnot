@@ -24,6 +24,7 @@ qa_pairs_path: officeqa/synth_dev_v2_qa_pairs.json
 # llm used by the nugget-completion judge (REQUIRED: the benchmark refuses to build without it,
 # so a run can't spend on the system and then fail at scoring)
 judge_model: null
+judge_provider_order: null
 # weight for a partially-supported nugget in the recall score
 partial_credit: 0.0
 # wall-clock cap (seconds) on one judge request (null = none); a timed-out request is retried by the client

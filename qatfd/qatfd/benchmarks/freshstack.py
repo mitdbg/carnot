@@ -191,6 +191,7 @@ class FreshstackBenchmark(Benchmark):
             nuggets=question.meta.get("nuggets", []),
             predicted=predicted,
             model=self.config.judge_model,
+            provider_order=self.config.judge_provider_order,
             judge_system=_JUDGE_SYSTEM,
             partial_credit=self.config.partial_credit,
         )

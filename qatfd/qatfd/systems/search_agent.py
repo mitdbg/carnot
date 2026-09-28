@@ -11,6 +11,7 @@ qatfd `retrieve()`/`compute()` shape. Two agent modes:
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from collections import deque
@@ -197,6 +198,19 @@ class SearchAgentSystem(RetrieveComputeSystem):
         return Retrieved(doc_ids=doc_ids, terminate_state=ts)
 
 
+    async def _run_collection_agent(self, which: str, ctx: ExecutionContext, coro) -> None:
+        """Run a Bootstrap / Enrich agent for its side effects on the collections. Its failure (typically
+        `StepFailed`: out of steps without a final answer) must not fail the question it happens to run
+        before / after: that question's own retrieval and answer are independent of it. Log it, leave a
+        trace event, and carry on with whatever collections the agent managed to curate."""
+        try:
+            await coro
+        except Exception as e:  # noqa: BLE001 — any collection-agent failure is non-fatal for the question
+            msg = f"{type(e).__name__}: {e}"
+            logging.getLogger(__name__).warning("[%s] %s agent failed; continuing with the current collections: %s",
+                                                self.name, which, msg)
+            ctx.tracer.emit(id=f"{which}_agent_failed", kind="lifecycle", level="warning", data={"error": msg})
+
     async def _precompute_working_sets(self, ctx: ExecutionContext, resources: BenchmarkResources):
         # construct the bootstrap agent
         agent = self._build_bootstrap_agent(ctx, resources)
@@ -238,7 +252,7 @@ class SearchAgentSystem(RetrieveComputeSystem):
             if first_question:
                 self._question_num = 0
             if mode in ("before", "both") and first_question:
-                await self._precompute_working_sets(ctx, resources)
+                await self._run_collection_agent("bootstrap", ctx, self._precompute_working_sets(ctx, resources))
         t1 = time.monotonic()
 
         try:
@@ -255,7 +269,7 @@ class SearchAgentSystem(RetrieveComputeSystem):
             if mode in ("after", "both"):
                 assert self.retrieve_config.enrich_query_batch_size is not None
                 if self._question_num % self.retrieve_config.enrich_query_batch_size == 0:
-                    await self._enrich(ctx, resources, list(self._question_history))
+                    await self._run_collection_agent("enrich", ctx, self._enrich(ctx, resources, list(self._question_history)))
         t3 = time.monotonic()
 
         # update answer_output with timing info
