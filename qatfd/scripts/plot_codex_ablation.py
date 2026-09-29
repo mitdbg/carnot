@@ -219,8 +219,18 @@ def iter_series(keys) -> list[dict]:
     return out
 
 
-def load_runs(results_root: Path, min_rows: int | None = None) -> dict[tuple[str, str], dict[int, dict]]:
-    """{(scenario, variant): {seed: run-level metrics}}."""
+def _agent_cost(r: dict) -> float:
+    return (r.get("precompute_cost") or 0.0) + (r.get("enrich_cost") or 0.0)
+
+
+def _agent_wall(r: dict) -> float:
+    return (r.get("precompute_wall_s") or 0.0) + (r.get("enrich_wall_s") or 0.0)
+
+
+def load_runs(results_root: Path, min_rows: int | None = None, answer_only: bool = False) -> dict[tuple[str, str], dict[int, dict]]:
+    """{(scenario, variant): {seed: run-level metrics}}. `answer_only` drops the Bootstrap / Enrich agents' spend and
+    wall time from cost / latency (they are otherwise on the row of the question they ran before / after), leaving
+    only what answering the questions cost: the amortized view, where the collection building is a one-off."""
     runs: dict[tuple[str, str], dict[int, dict]] = defaultdict(dict)
     for key, per_seed in find_runs(results_root, min_rows).items():
         for seed, d in per_seed.items():
@@ -238,9 +248,10 @@ def load_runs(results_root: Path, min_rows: int | None = None) -> dict[tuple[str
                 "quality": statistics.mean(r["score"] for r in rows),
                 # all-in $ per run; `cost` already includes the Bootstrap / Enrich collection agents'
                 # spend (they run on the question's LLM client), broken out here for the table
-                "cost": sum(r["cost"] for r in rows),
+                "cost": sum(r["cost"] - (_agent_cost(r) if answer_only else 0.0) for r in rows),
                 "collection_agent_cost": sum(r.get("precompute_cost", 0.0) + r.get("enrich_cost", 0.0) for r in rows),
-                "latency": sum(r["wall_s"] for r in rows if not latency_excluded(d.name, r["qid"])),
+                "latency": sum(r["wall_s"] - (_agent_wall(r) if answer_only else 0.0)
+                               for r in rows if not latency_excluded(d.name, r["qid"])),
                 "n_latency_excluded": sum(1 for r in rows if latency_excluded(d.name, r["qid"])),
             }
     return runs
@@ -266,7 +277,7 @@ def summarize(runs: dict[tuple[str, str], dict[int, dict]]) -> list[dict]:
 
 
 # at most this many series: every point also carries its series name (identity not by color alone)
-DIRECT_LABEL_MAX_SERIES = 5
+DIRECT_LABEL_MAX_SERIES = 4
 SHORT_NAMES = {
     "par": "parallel", "seq_resume": "seq + resume", "seq_shell": "seq + shell", "seq_shell_resume": "seq + shell + resume",
     "seq_iso": "seq iso", "seq_iso_bs": "seq iso + bootstrap", "seq_iso_en": "seq iso + enrich",
@@ -287,8 +298,11 @@ def plot(summary: list[dict], x_key: str, x_label: str, y_label: str, title: str
         )
         if len(summary) <= DIRECT_LABEL_MAX_SERIES:
             short = SHORT_NAMES.get(s["scenario"], s["scenario"]) + (f" [{s['variant']}]" if s["variant"] else "")
+            # centred under the bottom of the point's quality error bar: clear of horizontal neighbours' markers
+            # and error bars, which sit at similar quality but different cost / latency
             ax.annotate(
-                short, (x, y), xytext=(9, -6), textcoords="offset points", fontsize=8, color=INK_2, ha="left", va="top",
+                short, (x, y - yerr), xytext=(0, -5), textcoords="offset points", fontsize=8, color=INK_2,
+                ha="center", va="top",
             )
         # the legend names the series; only flag points where some questions produced no answer
         if s["ok"] < s["n"]:
@@ -329,13 +343,15 @@ def main() -> None:
     ap.add_argument("--variants", nargs="+", default=None, metavar="VARIANT",
                     help="only these variants; 'base' = the untagged runs (default: all)")
     ap.add_argument("--tag", default=None, help="suffix for the output file names, so a filtered figure keeps the full one")
+    ap.add_argument("--answer-only", action="store_true",
+                    help="exclude the Bootstrap / Enrich agents' cost and wall time (answering only; the amortized view)")
     args = ap.parse_args()
     results_root = Path(args.results_root)
     out_dir = Path(args.out_dir) if args.out_dir else results_root / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
     bench = benchmark_label(results_root, args.benchmark)
 
-    runs = load_runs(results_root, args.min_rows)
+    runs = load_runs(results_root, args.min_rows, answer_only=args.answer_only)
     if args.scenarios or args.variants:
         want_variants = None if args.variants is None else {"" if v == "base" else v for v in args.variants}
         runs = {
@@ -364,8 +380,9 @@ def main() -> None:
     suffix = f"{bench}_{args.tag}" if args.tag else bench
     cost_png = out_dir / f"codex_ablation_quality_vs_cost_{suffix}.png"
     lat_png = out_dir / f"codex_ablation_quality_vs_latency_{suffix}.png"
-    plot(summary, "cost", "cost: total $ per run (OpenRouter, incl. embeddings)", y_label, f"Codex ablation on {bench}: quality vs cost", cost_png)
-    plot(summary, "latency", "latency: total answer wall time per run (s)", y_label, f"Codex ablation on {bench}: quality vs latency", lat_png)
+    scope = "\n(answering only: excludes the Bootstrap / Enrich agents)" if args.answer_only else ""
+    plot(summary, "cost", f"cost: total $ per run (OpenRouter, incl. embeddings){scope}", y_label, f"Codex ablation on {bench}: quality vs cost", cost_png)
+    plot(summary, "latency", f"latency: total answer wall time per run (s){scope}", y_label, f"Codex ablation on {bench}: quality vs latency", lat_png)
     print(f"wrote {cost_png} and {lat_png}")
 
 

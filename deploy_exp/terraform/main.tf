@@ -280,3 +280,18 @@ resource "aws_autoscaling_group_tag" "experiment" {
     propagate_at_launch = false
   }
 }
+
+# Suspend AZRebalance on the experiment node group's ASG. With the cluster-autoscaler managing capacity, every
+# scale-down that empties an AZ made the ASG launch a node in that AZ ("to balance the group's zones"), overshoot
+# desired capacity, and then TERMINATE A BUSY NODE to get back down, killing whatever cells it ran (2026-09-29
+# codex-v1r2 sweep: four collection-agent cells restarted from question 0). Rebalancing ignores pods and the
+# safe-to-evict annotation, and nothing here needs it: the autoscaler alone decides where nodes go. There is no
+# native resource for suspending a process on a managed node group's ASG, so the aws cli does it; it re-runs
+# whenever the node group (and hence its ASG) is replaced. Needs the aws cli on the machine running terraform.
+resource "terraform_data" "experiment_suspend_az_rebalance" {
+  triggers_replace = [aws_eks_node_group.experiment.resources[0].autoscaling_groups[0].name]
+
+  provisioner "local-exec" {
+    command = "aws autoscaling suspend-processes --region ${var.aws_region} --auto-scaling-group-name ${aws_eks_node_group.experiment.resources[0].autoscaling_groups[0].name} --scaling-processes AZRebalance"
+  }
+}

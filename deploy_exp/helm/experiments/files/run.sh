@@ -81,11 +81,12 @@ if [[ -n "${CODEX_SANDBOX_UID:-}" ]]; then
     fi
     # a shell cell whose codex shell sandbox (bubblewrap, workspace-write) cannot start would answer with every shell
     # command failing: probe it as the sandbox uid and refuse the cell instead (unless the cell opted out of bwrap)
+    # (`codex sandbox` defaults to a READ-ONLY policy: the probe must ask for workspace-write, as `codex exec` does)
     if printf '%s\n' "${ARGV[@]}" | grep -qx 'systems.codex_shell=true' \
         && ! printf '%s\n' "${ARGV[@]}" | grep -qx 'systems.shell_sandbox_mode=danger-full-access'; then
         if ! (cd /codex/work && setpriv --reuid="$CODEX_SANDBOX_UID" --regid="$CODEX_SANDBOX_UID" --clear-groups \
                 env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/codex/home CODEX_HOME=/codex/home \
-                codex sandbox -- bash -c 'touch /codex/work/.bwrap_probe && rm /codex/work/.bwrap_probe'); then
+                codex sandbox -c 'sandbox_mode="workspace-write"' -- bash -c 'touch /codex/work/.bwrap_probe && rm /codex/work/.bwrap_probe'); then
             echo "[run] ERROR: codex's shell sandbox (bubblewrap) cannot start in this pod; refusing a shell cell."
             echo "[run]        Fix the node (unprivileged user namespaces) or pass systems.shell_sandbox_mode=danger-full-access"
             echo "[run]        (the pod's uid + iptables fence still applies)."

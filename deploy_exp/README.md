@@ -44,6 +44,16 @@ aws secretsmanager create-secret --name qatfd/experiments/llm \
   --secret-string '{"OPENROUTER_API_KEY":"sk-or-..."}'
 ```
 
+The experiment node group's ASG has **AZRebalance suspended** (`terraform_data.experiment_suspend_az_rebalance`,
+via the aws cli during apply). Left on, a scale-down that empties an AZ makes the ASG launch a node there, overshoot,
+and terminate a *busy* node to compensate, restarting every cell on it from scratch (it ignores pods and the
+safe-to-evict annotation). Check it with:
+
+```bash
+aws autoscaling describe-auto-scaling-groups --query \
+  "AutoScalingGroups[?contains(AutoScalingGroupName,'experiment-nodes')].SuspendedProcesses[].ProcessName"
+```
+
 Things the Job manifests must carry, or the cluster misbehaves:
 
 - `nodeSelector` and a toleration for `qatfd.io/workload=experiments` (output `experiment_node_selector`).

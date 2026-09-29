@@ -384,7 +384,10 @@ class CodexSystem(System):
             "-c", f"mcp_servers.corpus.enabled_tools={json.dumps(self.codex_config.enabled_tools)}",
             "-c", f'model_providers.openrouter.http_headers={{"x-session-id"="{analytics_id}"}}',
             "-c", f'mcp_servers.corpus.http_headers={{"x-session-id"="{analytics_id}"}}',
-            "--output-schema", schema_file, "-o", result_file, prompt,
+            # the prompt goes in on stdin (`-`), never as an argument: Linux caps ONE argv string at 128 KiB
+            # (MAX_ARG_STRLEN), and the collections summary alone outgrows that once the Enrich agent has built a
+            # few dozen collections -> "[Errno 7] Argument list too long" before codex even starts
+            "--output-schema", schema_file, "-o", result_file, "-",
         ]
 
         # run the codex agent
@@ -392,6 +395,7 @@ class CodexSystem(System):
         user_kwargs = {"user": uid, "group": uid, "extra_groups": []} if uid is not None else {}
         process = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=self._codex_env(),
@@ -400,7 +404,7 @@ class CodexSystem(System):
             cwd=str(work_dir),
             **user_kwargs,
         )
-        stdout, stderr = await process.communicate()
+        stdout, stderr = await process.communicate(input=prompt.encode())
         wall_s = time.monotonic() - t0
 
         # gather all events from stdout
