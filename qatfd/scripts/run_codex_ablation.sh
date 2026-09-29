@@ -7,6 +7,11 @@
 #   sequential  resume=on             x3   (one thread carried across all questions)
 #   sequential  shell=on  resume=off  x3   (opt-in: SCENARIOS="seq_shell seq_shell_resume"; the agent gets a
 #   sequential  shell=on  resume=on   x3    sandboxed shell and a persistent workspace with AGENTS.md)
+#   sequential  isolation             x3   (opt-in: SCENARIOS="seq_iso seq_iso_bs seq_iso_en seq_iso_bsen"; every
+#   sequential  isolation + Bootstrap x3    question is a fresh ephemeral codex session with no shell, like `par`, but
+#   sequential  isolation + Enrich    x3    run in arrival order so the Bootstrap / Enrich collection agents can build
+#   sequential  isolation + both      x3    collections between questions; mirrors the search agent's
+#                                           bootstrap_enrich_dev cells exp1 / exp3 / exp5 / exp7)
 # in seed-major order (every scenario at seed 0, then seed 1, ...) so the scenarios can be compared
 # after the first |SCENARIOS| runs; each for experiments.shuffle_seed in SEEDS: the seed fixes the ORDER the questions are asked in, which is
 # what the session-resume / shell scenarios are sensitive to. The parallel (isolation) baseline gets the
@@ -22,6 +27,17 @@
 # Idempotent: a run whose results.jsonl already has EXPECTED_N rows is skipped; a run dir that exists
 # but is incomplete is resumed via experiments.resume_dir (for sequential+resume this also picks up the
 # persisted codex thread id). Per-run stdout/stderr goes to $LOG_DIR/<label>.log.
+#
+# seq_iso* scenarios are NEVER resumed: the collection agents' state (question count, workload window, the
+# collections themselves) is not persisted, so an incomplete seq_iso* run is abandoned and started over in a
+# new run dir. Before every seq_iso* run (the no-agent baseline included) every collection on the chroma
+# server except the corpus copies (BASE_COLLECTION + KEEP_COLLECTIONS) is deleted and BASE_COLLECTION's
+# agent-written chunk metadata is stripped (scripts/lib/collection_reset.sh), so each run starts from the
+# pristine corpus. That requires BASE_COLLECTION to be a -v1 copy (the only collections the reset may strip),
+# and no other collection-building run (search_agent or codex) may share the chroma server.
+# Collection agents: AGENT_MODEL runs the Bootstrap / Enrich agents' own steps, MAP_MODEL their semantic_map
+# judge (defaults match the search agent's bootstrap_enrich_dev sweep), ENRICH_BATCH / MAX_PREVIOUS_QUERIES the
+# Enrich cadence and workload window. They bill through OPENROUTER_API_KEY (env or skunk/.env).
 #
 # Usage (from anywhere; runs for many hours — use nohup/tmux):
 #   nohup scripts/run_codex_ablation.sh > codex_ablation.out 2>&1 &
@@ -40,6 +56,10 @@
 #     # another qa_pairs file (e.g. the v3 sample): EXPECTED_N is derived from that file, and RESULTS_ROOT keeps
 #     # its runs under results/v3/officeqa_synth/codex so the plot scripts never mix them with the v2 runs
 #     # (plot with --results-root results/v3/officeqa_synth/codex; the figures are labelled officeqa_synth_v3)
+#   BASE_COLLECTION=officeqa-qwen-8b-v1 VARIANT=v1 SCENARIOS="seq_iso seq_iso_bs seq_iso_en seq_iso_bsen" \
+#       nohup scripts/run_codex_ablation.sh > codex_collection_agents.out 2>&1 &
+#     # sequential isolation +- Bootstrap / Enrich on the no-metadata corpus copy (plot with
+#     #   --scenarios par seq_iso seq_iso_bs seq_iso_en seq_iso_bsen --variants v1 --tag collection_agents)
 set -uo pipefail
 
 QATFD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -63,8 +83,17 @@ CHROMA_HOST="${CHROMA_HOST:-127.0.0.1}"
 CHROMA_PORT="${CHROMA_PORT:-8001}"
 MCP_PORT="${MCP_PORT:-8765}"
 DRY_RUN="${DRY_RUN:-0}"
+BASE_COLLECTION="${BASE_COLLECTION:-}"  # corpus collection (benchmarks.collection_name); empty = the benchmark yaml's
+KEEP_COLLECTIONS="${KEEP_COLLECTIONS:-officeqa-qwen-8b officeqa-qwen-8b-v1}"  # corpus copies the seq_iso* wipe never deletes
+MODEL="${MODEL:-openai/gpt-5.6-luna}"               # inference.llm_model for seq_iso*: the fallback for any agent model left null
+AGENT_MODEL="${AGENT_MODEL:-openai/gpt-5.6-terra}"  # Bootstrap / Enrich agents' own steps
+MAP_MODEL="${MAP_MODEL:-openai/gpt-5.6-luna}"       # Bootstrap / Enrich semantic_map judge
+ENRICH_BATCH="${ENRICH_BATCH:-5}"                   # EnrichAgent runs after every ENRICH_BATCH questions
+MAX_PREVIOUS_QUERIES="${MAX_PREVIOUS_QUERIES:-50}"  # EnrichAgent workload window (questions shown to it)
 
 export PATH="$HOME/.local/bin:$PATH"
+
+source "$QATFD_DIR/scripts/lib/collection_reset.sh"   # wipe_collections / reset_corpus_metadata
 
 log() { printf '[%s] %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$*"; }
 
@@ -108,6 +137,12 @@ esac
 # looks for (and resumes) runs under RESULTS_ROOT
 [[ "$RESULTS_ROOT" == "$QATFD_DIR/results" ]] || BENCH_OVERRIDES="$BENCH_OVERRIDES results_root=$RESULTS_ROOT"
 [[ -z "$SHUFFLE_GROUP_KEY" ]] || BENCH_OVERRIDES="$BENCH_OVERRIDES experiments.shuffle_group_key=$SHUFFLE_GROUP_KEY"
+[[ -z "$BASE_COLLECTION" ]] || BENCH_OVERRIDES="$BENCH_OVERRIDES benchmarks.collection_name=$BASE_COLLECTION"
+
+# seq_iso* = sequential isolation (+- the collection agents); they get the wipe / reset / no-resume treatment
+is_iso_scenario() { [[ "$1" == seq_iso* ]]; }
+ANY_ISO=0
+for s in $SCENARIOS; do is_iso_scenario "$s" && ANY_ISO=1; done
 
 # ---------------------------------------------------------------------------
 # preflight
@@ -127,18 +162,42 @@ preflight() {
     if (exec 3<>"/dev/tcp/127.0.0.1/$MCP_PORT") 2>/dev/null; then
         log "ABORT: something is already listening on the MCP port $MCP_PORT (stale runner?)"; ok=0
     fi
+    if [[ $ANY_ISO -eq 1 ]]; then
+        if [[ -z "${OPENROUTER_API_KEY:-}" ]] && ! grep -q '^OPENROUTER_API_KEY=' "$QATFD_DIR/../skunk/.env" 2>/dev/null; then
+            log "ABORT: OPENROUTER_API_KEY is unset (env or skunk/.env); the Bootstrap / Enrich agents bill through it"; ok=0
+        fi
+        # the wipe + metadata reset before each seq_iso* run may only strip a -v1 copy
+        if [[ "$BASE_COLLECTION" != *-v1 ]]; then
+            log "ABORT: seq_iso* scenarios need BASE_COLLECTION=<a -v1 corpus copy> (got '${BASE_COLLECTION:-<yaml default>}')"; ok=0
+        fi
+        # any other runner on this chroma server would have its collections wiped by (or leak into) this sweep
+        if ps -eo args | grep -E '^[^ ]*python[0-9.]* -m qatfd\.runner' | grep -q 'systems='; then
+            log "ABORT: another qatfd.runner is running (collections are shared on the chroma server)"; ok=0
+        fi
+    fi
     [[ $ok -eq 1 ]] || exit 1
 }
 
 # ---------------------------------------------------------------------------
 # scenario -> hydra overrides
 # ---------------------------------------------------------------------------
+# systems.isolation (default true in configs/systems/codex.yaml) is set explicitly everywhere: true = a fresh
+# ephemeral session with its own work dir per question; the resume / shell scenarios carry state across questions
+ISO="experiments.run_mode=sequential experiments.workers=1 systems.isolation=true systems.codex_shell=false \
+systems.session_resume=false inference.llm_model=$MODEL"
+COLLECTION_AGENTS="systems.bootstrap_config.llm_model=$AGENT_MODEL systems.bootstrap_config.semantic_map_llm_model=$MAP_MODEL \
+systems.enrich_config.llm_model=$AGENT_MODEL systems.enrich_config.semantic_map_llm_model=$MAP_MODEL \
+systems.enrich_config.max_previous_queries=$MAX_PREVIOUS_QUERIES systems.enrich_query_batch_size=$ENRICH_BATCH"
 scenario_overrides() {
     case "$1" in
-        par)              echo "experiments.run_mode=parallel experiments.workers=$WORKERS systems.codex_shell=false systems.session_resume=false" ;;
-        seq_resume)       echo "experiments.run_mode=sequential systems.codex_shell=false systems.session_resume=true" ;;
-        seq_shell)        echo "experiments.run_mode=sequential systems.codex_shell=true  systems.session_resume=false" ;;
-        seq_shell_resume) echo "experiments.run_mode=sequential systems.codex_shell=true  systems.session_resume=true" ;;
+        par)              echo "experiments.run_mode=parallel experiments.workers=$WORKERS systems.isolation=true systems.codex_shell=false systems.session_resume=false" ;;
+        seq_resume)       echo "experiments.run_mode=sequential systems.isolation=false systems.codex_shell=false systems.session_resume=true" ;;
+        seq_shell)        echo "experiments.run_mode=sequential systems.isolation=false systems.codex_shell=true  systems.session_resume=false" ;;
+        seq_shell_resume) echo "experiments.run_mode=sequential systems.isolation=false systems.codex_shell=true  systems.session_resume=true" ;;
+        seq_iso)          echo "$ISO systems.enrich_working_sets=null" ;;
+        seq_iso_bs)       echo "$ISO $COLLECTION_AGENTS systems.enrich_working_sets=before" ;;
+        seq_iso_en)       echo "$ISO $COLLECTION_AGENTS systems.enrich_working_sets=after" ;;
+        seq_iso_bsen)     echo "$ISO $COLLECTION_AGENTS systems.enrich_working_sets=both" ;;
         *) log "ABORT: unknown scenario '$1'"; exit 1 ;;
     esac
 }
@@ -164,9 +223,13 @@ if [[ -n "$VARIANT" && ! "$VARIANT" =~ ^[a-z0-9]+$ ]]; then
     log "ABORT: VARIANT='$VARIANT' must match [a-z0-9]+ (the plot scripts parse it out of the run name)"; exit 1
 fi
 [[ "$DRY_RUN" == "1" ]] || preflight
+if [[ " $SCENARIOS " == *" seq_shell"* ]]; then
+    log "WARNING: shell scenarios on this box are NOT sandboxed (codex runs as $(id -un) and can read the disk, incl. the gold"
+    log "         answers); run them on the cluster (python -m qatfd.k8s ... --sweep codex_ablation) or scan the traces afterwards"
+fi
 mkdir -p "$LOG_DIR"
 cd "$QATFD_DIR"
-log "benchmark=$BENCHMARK split=$SPLIT expected_n=$EXPECTED_N seeds='$SEEDS' scenarios='$SCENARIOS'${JUDGE_MODEL:+ judge=$JUDGE_MODEL}${SHUFFLE_GROUP_KEY:+ shuffle_by=$SHUFFLE_GROUP_KEY}${QA_PAIRS_PATH:+ qa_pairs=$QA_PAIRS_PATH} run_root=$RUN_ROOT"
+log "benchmark=$BENCHMARK collection=${BASE_COLLECTION:-<yaml default>} split=$SPLIT expected_n=$EXPECTED_N seeds='$SEEDS' scenarios='$SCENARIOS'${VARIANT:+ variant=$VARIANT}$( [[ $ANY_ISO -eq 1 ]] && echo " agent_model=$AGENT_MODEL map_model=$MAP_MODEL enrich_batch=$ENRICH_BATCH window=$MAX_PREVIOUS_QUERIES" )${JUDGE_MODEL:+ judge=$JUDGE_MODEL}${SHUFFLE_GROUP_KEY:+ shuffle_by=$SHUFFLE_GROUP_KEY}${QA_PAIRS_PATH:+ qa_pairs=$QA_PAIRS_PATH} run_root=$RUN_ROOT"
 
 # seed-major order: every scenario at seed 0 first, then seed 1, ... so a full cross-scenario comparison
 # exists after the first |SCENARIOS| runs rather than only at the end of the sweep.
@@ -179,6 +242,7 @@ for seed in $SEEDS; do
 experiments.run_name=$label systems.codex_scratch_dir=$workspace $(scenario_overrides "$scenario")$BENCH_OVERRIDES $EXTRA_OVERRIDES"
 
         existing="$(find_run_dir "$label")"
+        fresh=1
         if [[ -n "$existing" ]]; then
             n="$(result_rows "$existing/results.jsonl")"
             if [[ "$n" -ge "$EXPECTED_N" ]]; then
@@ -186,9 +250,15 @@ experiments.run_name=$label systems.codex_scratch_dir=$workspace $(scenario_over
                 summary+=("skip   $label")
                 continue
             fi
-            log "RESUME $label: $n/$EXPECTED_N rows at $existing (workspace kept: $workspace)"
-            overrides="$overrides experiments.resume_dir=$existing"
-        else
+            if ! is_iso_scenario "$scenario"; then
+                log "RESUME $label: $n/$EXPECTED_N rows at $existing (workspace kept: $workspace)"
+                overrides="$overrides experiments.resume_dir=$existing"
+                fresh=0
+            else
+                log "RESTART $label: abandoning incomplete $existing ($n/$EXPECTED_N rows); seq_iso* runs are never resumed"
+            fi
+        fi
+        if [[ $fresh -eq 1 ]]; then
             # a fresh run must not inherit a previous attempt's files / AGENTS.md from the shared workspace path
             if [[ -d "$workspace" && "$workspace" == "$WORKSPACES_ROOT/codex_"* ]]; then
                 log "START $label (clearing stale workspace $workspace)"
@@ -200,9 +270,24 @@ experiments.run_name=$label systems.codex_scratch_dir=$workspace $(scenario_over
 
         cmd=("$PYTHON" -m qatfd.runner $overrides)
         if [[ "$DRY_RUN" == "1" ]]; then
+            is_iso_scenario "$scenario" && echo "  (wipe all non-corpus collections on $CHROMA_HOST:$CHROMA_PORT; reset $BASE_COLLECTION's chunk metadata)"
             printf '  %q' "${cmd[@]}"; printf '\n'
             summary+=("dry    $label")
             continue
+        fi
+
+        # seq_iso*: start from the pristine corpus (no collections from an earlier run, no agent-written metadata)
+        if is_iso_scenario "$scenario"; then
+            if ! wipe_collections; then
+                log "FAILED $label: could not wipe collections; skipping"
+                summary+=("FAILED(wipe) $label")
+                continue
+            fi
+            if ! reset_corpus_metadata; then
+                log "FAILED $label: could not reset $BASE_COLLECTION's chunk metadata; skipping"
+                summary+=("FAILED(reset) $label")
+                continue
+            fi
         fi
 
         t0=$(date +%s)

@@ -1,11 +1,13 @@
 """Sweep generators: each module exposes `NAME`, `add_arguments(parser)` for its knobs, and
-`cells(args) -> list[Cell]`. Register new sweeps in `SWEEPS`."""
+`cells(args) -> list[Cell]`, and optionally `chart_values(args) -> dict` (release-level chart values, deep-merged into
+the values file by `submit`). Register new sweeps in `SWEEPS`."""
 
 from __future__ import annotations
 
-from qatfd.k8s.sweeps import bootstrap_enrich_dev, bootstrap_enrich_ub
+from qatfd.k8s.sweeps import bootstrap_enrich_dev, bootstrap_enrich_ub, codex_ablation
 
 SWEEPS = {
     bootstrap_enrich_ub.NAME: bootstrap_enrich_ub,
     bootstrap_enrich_dev.NAME: bootstrap_enrich_dev,
+    codex_ablation.NAME: codex_ablation,
 }

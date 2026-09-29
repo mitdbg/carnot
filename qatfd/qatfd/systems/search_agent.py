@@ -70,7 +70,6 @@ class SearchAgentSystem(RetrieveComputeSystem):
         self._question_lock = Lock()
         self._question_num = None
 
-
         assert isinstance(retrieve_config, QATFDSearchAgentConfig)
         max_previous_queries = retrieve_config.enrich_config.max_previous_queries
         self._question_history: deque[str] = deque(maxlen=max(0, max_previous_queries))
@@ -243,6 +242,7 @@ class SearchAgentSystem(RetrieveComputeSystem):
             for collection in collections:
                 if collection["is_working_set"] and collection["created_by_agent_type"] == "SearchAgent":
                     delete_collection(collection["name"])
+
 
     async def answer(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext, analytics_id: str) -> AnswerOutput:
         t0 = time.monotonic()

@@ -125,5 +125,36 @@ PUSH=0 deploy_exp/docker/build_push.sh     # build only
 `docker-compose.yaml` runs the pod shape locally (chroma + runner) against a store copy for a
 one-question smoke test before anything touches the cluster; see its header for the knobs.
 
-Not in the image: the Codex CLI (the `codex` system) and anything GPU-side (vLLM). Add them when
-those systems move to the cluster.
+The Codex CLI (the `codex` system) is in the image: `build_push.sh` stages the dev box's own standalone
+release (`~/.codex/packages/standalone/current`, checked to be 0.150.1) into `deploy_exp/docker/codex/`
+(git-ignored) and the Dockerfile copies it to `/opt/codex`. Not in the image: anything GPU-side (vLLM).
+
+## Codex cells
+
+`python -m qatfd.k8s ... --sweep codex_ablation` (qatfd/qatfd/k8s/sweeps/codex_ablation.py) runs the codex
+system, one pod per (scenario, seed). Two extra keys in the `llm-keys` Secret:
+
+```bash
+kubectl -n experiments patch secret llm-keys --type merge \
+  -p '{"stringData":{"OPENROUTER_CODEX_API_KEY":"sk-or-...","OPENROUTER_MGMT_API_KEY":"sk-or-..."}}'
+```
+
+**The sandbox.** A shell-enabled codex once answered questions by reading the gold-answer CSV and earlier runs'
+results off the disk. In a codex pod (values `codexSandbox.enabled`, which the sweep sets) that is not possible:
+
+- codex runs as the unprivileged `codex` user (uid 10001, `systems.sandbox_uid`); `run.sh` makes `/data`
+  (benchmark files incl. the gold answers, the raw corpus pages and PDFs, the chroma store) and `/results` root-only,
+  and codex gets `/codex/home` + `/codex/work` of its own (filed into the run dir as `codex_home/` + `codex_scratch/`
+  when the cell ends). The answer schema it needs is copied into its home.
+- codex's environment is a short allowlist (`_CODEX_ENV_PASSTHROUGH` in qatfd/qatfd/systems/codex.py) plus its own
+  OpenRouter key: no runner key, no management key, no AWS variables.
+- the `lockdown` init container (NET_ADMIN, `files/lockdown.sh`) installs iptables rules in the pod's network
+  namespace: the codex uid may open TCP connections to 127.0.0.1 on the MCP port and the egress-proxy port only
+  (no DNS, chroma, S3/STS, instance metadata, Kubernetes API, internet; no IPv6 at all). `files/egress_proxy.py`
+  tunnels `CONNECT` to `codexSandbox.allowHosts` (openrouter.ai) on :443 and logs every refusal. The service-account
+  tokens are readable but unusable: nothing that accepts them is reachable.
+- `run.sh` proves the fence from the codex uid's side (`files/sandbox_check.py`) and refuses to run the cell
+  (exit 78) if any check fails; the lockdown container likewise fails the pod rather than start unfenced.
+
+The codex shell tool still runs in codex's own sandbox (bubblewrap from the release dir) on top of this. The
+trace scan for gold / results paths (`traces/*.codex.jsonl`) is still worth running as a tripwire.

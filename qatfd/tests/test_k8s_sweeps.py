@@ -161,3 +161,59 @@ def test_dev_sweep_model_knobs():
     assert "systems.retrieve.enrich_working_sets=both" in ov
     assert "systems.retrieve.disable_reasoning=true" in ov and "systems.retrieve.enrich_config.disable_reasoning=true" in ov
     assert not any(a.startswith("systems.compute.disable_reasoning") for a in ov)
+
+
+# ---------------------------------------------------------------------------------------------
+# codex_ablation
+# ---------------------------------------------------------------------------------------------
+
+def _codex_args(*argv: str):
+    import argparse
+    from qatfd.k8s.sweeps import codex_ablation
+    p = argparse.ArgumentParser()
+    codex_ablation.add_arguments(p)
+    return p.parse_args(list(argv))
+
+
+def test_codex_sweep_labels_parse_in_the_plot_script():
+    import importlib.util
+    from pathlib import Path
+    from qatfd.k8s.sweeps import codex_ablation
+    spec = importlib.util.spec_from_file_location("plot_codex_ablation", Path(__file__).parents[1] / "scripts" / "plot_codex_ablation.py")
+    plot = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plot)
+
+    cells = codex_ablation.cells(_codex_args())
+    assert len(cells) == 8 * 3 and len({c.label for c in cells}) == len(cells)
+    for c in cells:
+        info = plot.parse_run_name(f"{c.label}_20260930_120000")
+        assert info is not None, c.label
+        want = c.meta["scenario"].removesuffix("_c40")
+        assert info["scenario"] == want and info["seed"] == c.meta["seed"]
+        assert info["variant"] == ("v1r2c40" if c.meta["scenario"].endswith("_c40") else "v1r2")
+        assert c.system_dir == "codex" and c.expected_rows == 33 and c.collection == "officeqa-qwen-8b-v1"
+
+
+def test_codex_sweep_sandbox_and_pdfs_by_default():
+    from qatfd.k8s.sweeps import codex_ablation
+    args = _codex_args()
+    assert codex_ablation.chart_values(args)["codexSandbox"]["enabled"] is True
+    for c in codex_ablation.cells(args):
+        assert "systems.sandbox_uid=10001" in c.argv and "systems.egress_proxy=http://127.0.0.1:3128" in c.argv
+        assert "benchmarks.pdf_dir=null" not in c.argv
+        assert "officeqa/treasury_bulletin_pdfs/" in c.data
+        agents = c.meta["scenario"].startswith("seq_iso_")
+        assert ("systems.enrich_query_batch_size=5" in c.argv) == agents
+
+
+def test_codex_sweep_refuses_unsandboxed_shell_and_bad_variant():
+    from qatfd.k8s.sweeps import codex_ablation
+    with pytest.raises(SystemExit):
+        codex_ablation.cells(_codex_args("--no-sandbox"))
+    assert codex_ablation.cells(_codex_args("--no-sandbox", "--scenarios", "seq_iso"))
+    with pytest.raises(SystemExit):
+        codex_ablation.cells(_codex_args("--variant", "V1-r2"))
+
+
+def test_submit_merges_sweep_chart_values():
+    assert cli._deep_merge({"job": {"a": 1}, "x": 1}, {"job": {"b": 2}, "x": 2}) == {"job": {"a": 1, "b": 2}, "x": 2}

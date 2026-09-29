@@ -46,6 +46,25 @@ secrets:
   # Leave empty to skip the env injection (e.g. once the runner reads Secrets Manager itself; the IRSA role
   # already allows secretsmanager:GetSecretValue on qatfd/experiments/*).
   llmSecretName: llm-keys
+  # codex cells also read these two keys from the same Secret (injected as optional env: a Secret without them
+  # still works for every other system). Add them with:
+  #   kubectl -n experiments patch secret llm-keys --type merge -p \
+  #     '{"stringData":{"OPENROUTER_CODEX_API_KEY":"sk-or-...","OPENROUTER_MGMT_API_KEY":"sk-or-..."}}'
+  #   OPENROUTER_CODEX_API_KEY  codex's own model calls + the MCP server's query embeddings
+  #   OPENROUTER_MGMT_API_KEY   the runner's per-question spend metering (OpenRouter analytics API)
+
+# Codex sandbox (the codex sweeps turn it on; see deploy_exp/README.md "Codex cells"). The codex subprocess runs as
+# `uid` (the cell's argv carries systems.sandbox_uid=<uid>), /data and /results become root-only, and an init
+# container with NET_ADMIN installs iptables rules so that uid can only reach the MCP server and the egress
+# proxy (files/egress_proxy.py), which tunnels to `allowHosts` on :443 and nothing else. run.sh self-checks the
+# fence from the sandbox uid's side and refuses to run the cell if any check fails.
+codexSandbox:
+  enabled: false
+  uid: 10001              # the `codex` user baked into the image (deploy_exp/docker/Dockerfile)
+  mcpPort: 8765           # must match benchmarks.mcp_url (configs/benchmarks/base.yaml)
+  proxyPort: 3128
+  allowHosts:
+    - openrouter.ai
 
 # A sweep runs one benchmark; this selects the sizing profile under `benchmarks:` below.
 benchmark: officeqa

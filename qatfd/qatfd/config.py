@@ -154,11 +154,46 @@ class CodexConfig(AgentConfig):
     corpus_interaction: Literal["tools", "dci", "both"] = "tools"
     # whether we are running questions in parallel or in sequence (copied at runtime from ExperimentConfig)
     run_mode: Literal["parallel", "sequential"]
+    # whether we are executing questions in isolation from one another or not
+    isolation: bool
     # token threshold at which Codex auto-compacts the thread; None keeps Codex's default
     # (90% of the model context window). Codex clamps any value to that 90% ceiling.
     auto_compact_token_limit: int | None = None
     # used when codex_shell is True in order to place the scratch directory outside of the benchmarks directory
     codex_scratch_dir: str | None = None
+    # codex's CODEX_HOME (config.toml, sessions, state db); None = <run_dir>/codex_home. The k8s codex sweep puts it
+    # outside /results so the sandbox user never needs to reach into the (root-only) run dir
+    codex_home_dir: str | None = None
+    # run the codex subprocess as this uid/gid (the runner must be root to switch); None = the runner's own user.
+    # The k8s codex sweep sets it together with a root-only /data and /results, so a shell-enabled codex cannot
+    # read the gold answers, the raw corpus files, the chroma store, or other results (see deploy_exp/README.md)
+    sandbox_uid: int | None = None
+    # HTTPS proxy for codex's own traffic (the pod's allowlisting egress proxy, files/egress_proxy.py); None = direct
+    egress_proxy: str | None = None
+    # codex's own sandbox for its shell tool (codex_shell=true): "workspace-write" (bubblewrap: writes only in the work
+    # dir, no network) or "danger-full-access" (no bubblewrap; only for pods where bwrap cannot start, since the
+    # pod's uid + iptables sandbox then is the only fence)
+    shell_sandbox_mode: Literal["workspace-write", "danger-full-access"] = "workspace-write"
+    # whether to enrich working sets with additional metadata;
+    # - null means we do not perform enrichment
+    # - "before" means we enrich as a pre-processing step before any queries arrive (BootstrapAgent)
+    # - "after" means we enrich after queries arrive (EnrichAgent, every enrich_query_batch_size questions)
+    # - "both" means we bootstrap before the first query AND enrich after every batch of queries
+    enrich_working_sets: Literal[None, "before", "after", "both"] = None
+    # the batch size (in number of queries) to enrich working sets if enrich_working_sets="after"
+    enrich_query_batch_size: int | None = None
+    # configuration for a BootstrapAgent to create initial working sets
+    bootstrap_config: BootstrapConfig
+    # configuration for an EnrichAgent to enrich existing working sets
+    enrich_config: EnrichConfig
+
+    def __post_init__(self) -> None:
+        if (p := getattr(super(), "__post_init__", None)) is not None:
+            p()
+        if isinstance(self.bootstrap_config, dict):
+            self.bootstrap_config = BootstrapConfig(**{"name": "bootstrap", **self.bootstrap_config})
+        if isinstance(self.enrich_config, dict):
+            self.enrich_config = EnrichConfig(**{"name": "enrich", **self.enrich_config})
 
 
 # ---------------------------------------------------------------------------

@@ -44,9 +44,10 @@ RUN pip install --no-deps -e /app/skunk -e /app/qatfd
 FROM python:3.14-slim
 
 # curl: chroma heartbeat probes; zstd + tar: store tarballs; procps: ps/pgrep for the chroma scripts;
+# iptables: the codex sandbox's egress fence (files/lockdown.sh, codex cells only);
 # aws cli v2: S3 pulls/syncs and Secrets Manager reads (the zip installer, same as on the dev box)
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl unzip zstd tar procps \
+ && apt-get install -y --no-install-recommends ca-certificates curl unzip zstd tar procps iptables \
  && rm -rf /var/lib/apt/lists/* \
  && curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip \
  && unzip -q /tmp/awscliv2.zip -d /tmp \
@@ -54,6 +55,17 @@ RUN apt-get update \
  && rm -rf /tmp/aws /tmp/awscliv2.zip
 
 COPY --from=builder /app /app
+
+# The Codex CLI (the `codex` system): the exact standalone release the dev box runs, staged into the build context
+# by build_push.sh (deploy_exp/docker/codex/, git-ignored), so pod runs use the same version as local ones. The
+# release dir keeps its layout: bin/codex finds its bundled bubblewrap (the shell tool's sandbox) under codex-resources/.
+COPY deploy_exp/docker/codex/ /opt/codex/
+RUN ln -s /opt/codex/bin/codex /usr/local/bin/codex && codex --version
+
+# The codex sandbox user (values codexSandbox.uid == the cell's systems.sandbox_uid). It owns nothing in the image;
+# run.sh gives it /codex/{home,work} and makes /data and /results root-only. A real login shell: codex's shell
+# tool starts the user's shell.
+RUN useradd --uid 10001 --user-group --no-create-home --home-dir /codex/home --shell /bin/bash codex
 
 ENV PATH=/app/skunk/venv/bin:$PATH \
     PYTHONUNBUFFERED=1 \

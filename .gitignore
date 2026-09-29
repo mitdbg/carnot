@@ -339,3 +339,6 @@ qatfd/benchmarks/**
 # codex home dirs: only the config is source; everything else is runtime state
 qatfd/benchmarks/*/codex/**
 !qatfd/benchmarks/*/codex/config.toml
+
+# codex CLI release staged into the image build context by deploy_exp/docker/build_push.sh
+deploy_exp/docker/codex/

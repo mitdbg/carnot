@@ -6,6 +6,7 @@
 !qatfd/
 !deploy_exp/docker/requirements.lock
 !deploy_exp/docker/requirements-extra.txt
+!deploy_exp/docker/codex/
 
 # inside skunk/ and qatfd/: data, results, virtualenvs, caches
 **/venv/

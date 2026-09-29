@@ -71,6 +71,24 @@ spec:
             name: {{ .Release.Name }}-scripts
             defaultMode: 0755
       initContainers:
+        {{- if .Values.codexSandbox.enabled }}
+        # 0. codex cells: fence the codex sandbox uid's network (iptables in the pod's shared network namespace)
+        - name: lockdown
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["bash", "/scripts/lockdown.sh"]
+          env:
+            {{- include "experiments.codexSandboxEnv" . | nindent 12 }}
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add: ["NET_ADMIN"]
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts, readOnly: true }
+        {{- end }}
         # 1. pull the store + benchmark files (runs to completion before anything else starts)
         - name: fetch-data
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -138,6 +156,17 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.secrets.llmSecretName }}
                   key: OPENROUTER_API_KEY
+            {{- range list "OPENROUTER_CODEX_API_KEY" "OPENROUTER_MGMT_API_KEY" }}
+            - name: {{ . }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secrets.llmSecretName }}
+                  key: {{ . }}
+                  optional: true
+            {{- end }}
+            {{- end }}
+            {{- if .Values.codexSandbox.enabled }}
+            {{- include "experiments.codexSandboxEnv" . | nindent 12 }}
             {{- end }}
           resources:
             requests:

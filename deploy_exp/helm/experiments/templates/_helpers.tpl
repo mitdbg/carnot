@@ -51,3 +51,15 @@ qatfd.io/sweep: {{ .Release.Name }}
     fieldRef:
       fieldPath: metadata.name
 {{- end }}
+
+{{/* The codex sandbox's knobs, for the lockdown init container and the runner (run.sh / sandbox_check.py). */}}
+{{- define "experiments.codexSandboxEnv" -}}
+- name: CODEX_SANDBOX_UID
+  value: {{ .Values.codexSandbox.uid | quote }}
+- name: CODEX_MCP_PORT
+  value: {{ .Values.codexSandbox.mcpPort | quote }}
+- name: CODEX_PROXY_PORT
+  value: {{ .Values.codexSandbox.proxyPort | quote }}
+- name: CODEX_EGRESS_ALLOW
+  value: {{ join " " .Values.codexSandbox.allowHosts | quote }}
+{{- end }}

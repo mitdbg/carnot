@@ -22,11 +22,92 @@ enabled_tools:
   - read_document
   - search_corpus
   - grep_corpus
+  - view_figure
 # URL of the MCP server
 mcp_url: ${benchmarks.mcp_url}
 # style of corpus interaction for the codex system; one of "tools", "dci", or "both"
 corpus_interaction: tools
 # whether queries are executed in parallel or in sequence
 run_mode: ${experiments.run_mode}
+# whether queries are executed in isolation from one another
+isolation: true
+# codex's CODEX_HOME; null = <run_dir>/codex_home
+codex_home_dir: null
+# run the codex subprocess as this uid (runner must be root); null = the runner's user. Set by the k8s codex sweep.
+sandbox_uid: null
+# HTTPS proxy for codex's own traffic; null = direct. Set by the k8s codex sweep (the pod's allowlisting proxy).
+egress_proxy: null
+# codex's own sandbox for its shell tool: workspace-write (bubblewrap) | danger-full-access (only where bwrap cannot start)
+shell_sandbox_mode: workspace-write
 # token threshold at which codex auto-compacts the thread; null = codex default (90% of context window)
 auto_compact_token_limit: null
+# whether to enrich working sets with additional metadata;
+# - null means we do not perform enrichment
+# - "before" means we enrich as a pre-processing step before any queries arrive (BootstrapAgent)
+# - "after" means we enrich after queries arrive (EnrichAgent, every enrich_query_batch_size questions)
+# - "both" means we bootstrap before the first query AND enrich after every batch of queries
+enrich_working_sets: null
+# the batch size (in number of queries) to enrich working sets if enrich_working_sets="after"
+enrich_query_batch_size: null
+
+### Bootstrap Agent Config ###
+bootstrap_config:
+  agent_id: ${systems.name}-bootstrap
+  # model for the bootstrap agent's own steps; null => inference.llm_model
+  llm_model: null
+  # no thinking tokens on the agent's own steps (OpenRouter reasoning effort "none"); only for models that can run without thinking, e.g. Qwen3
+  disable_reasoning: false
+  max_steps: 40
+  semantic_map_max_workers: 16
+  semantic_map_max_candidate_chunks: 10000
+  semantic_map_context_frac: 0.9
+  semantic_map_llm_model: null
+  semantic_map_provider_order: null
+  semantic_map_max_output_tokens: 4096
+  semantic_map_disable_reasoning: true
+  map_max_workers: 32
+  max_parallel_chroma_queries: 16
+  # target dollar cost budget for the bootstrap agent; null means no budget limit (default)
+  cost_budget: null
+  # target latency budget for the bootstrap agent; null means no latency limit (default)
+  latency_budget: null
+  # maximum number of chunks one create/add/copy/merge collection tool call may move
+  max_copy_chunks: 100000
+  # search / grep results are rendered as a summary: the first N chunks per collection, each
+  # truncated to M characters (the full result set is still what gets added to a collection)
+  search_preview_chunks: 10
+  search_preview_chars: 400
+  # number of sample rows rendered per collection after a map / semantic_map call
+  map_preview_samples: 5
+
+### Enrich Agent Config ###
+enrich_config:
+  agent_id: ${systems.name}-enrich
+  # model for the enrich agent's own steps; null => inference.llm_model
+  llm_model: null
+  # no thinking tokens on the agent's own steps (OpenRouter reasoning effort "none"); only for models that can run without thinking, e.g. Qwen3
+  disable_reasoning: false
+  max_steps: 20
+  # the number of most recent queries (handled by the system) shown to the agent as the query workload
+  max_previous_queries: 20
+  semantic_map_max_workers: 16
+  semantic_map_max_candidate_chunks: 10000
+  semantic_map_context_frac: 0.9
+  semantic_map_llm_model: null
+  semantic_map_provider_order: null
+  semantic_map_max_output_tokens: 4096
+  semantic_map_disable_reasoning: true
+  map_max_workers: 32
+  max_parallel_chroma_queries: 16
+  # target dollar cost budget for the bootstrap agent; null means no budget limit (default)
+  cost_budget: null
+  # target latency budget for the bootstrap agent; null means no latency limit (default)
+  latency_budget: null
+  # maximum number of chunks one create/add/copy/merge collection tool call may move
+  max_copy_chunks: 100000
+  # search / grep results are rendered as a summary: the first N chunks per collection, each
+  # truncated to M characters (the full result set is still what gets added to a collection)
+  search_preview_chunks: 10
+  search_preview_chars: 400
+  # number of sample rows rendered per collection after a map / semantic_map call
+  map_preview_samples: 5

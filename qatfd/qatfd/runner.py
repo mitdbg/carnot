@@ -139,7 +139,7 @@ def _meter_codex_rows(rows: list[Result], tracker: UsageTracker) -> None:
             r.total_output_tokens = ext["output_tokens"]
             r.total_cache_input_tokens = ext["cached_tokens"]
             r.total_embed_tokens, r.total_embed_calls, r.total_embed_cost = ext["embed_tokens"], ext["embed_calls"], embed_cost
-            r.cost = float(ext["model_cost"]) + embed_cost
+            r.cost = float(ext["model_cost"]) + embed_cost + r.precompute_cost + r.enrich_cost
 
 
 def _openrouter_session_usage(
@@ -509,6 +509,11 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
             "precompute_cost": tracker.cost(key=extra_keys["precompute"]) if extra_keys.get("precompute") else 0.0,
             "enrich_cost": tracker.cost(key=extra_keys["enrich"]) if extra_keys.get("enrich") else 0.0,
         }
+    elif isinstance(rc.system, CodexSystem):
+        if rc.system.codex_config.enrich_working_sets in ("before", "both"):
+            usage["precompute_cost"] = ctx.llm_client.usage.cost(key=rc.system.bootstrap_usage_key)
+        if rc.system.codex_config.enrich_working_sets in ("after", "both"):
+            usage["enrich_cost"] = ctx.llm_client.usage.cost(key=rc.system.enrich_usage_key)
 
     score, scorer, judge_rationale = 0.0, "", ""
     if not failed:

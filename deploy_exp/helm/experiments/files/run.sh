@@ -61,8 +61,42 @@ PY
     sleep 3
 done
 
-# --- run the cell, mirroring /results every SYNC_INTERVAL seconds in the background
+# --- codex sandbox (codex cells only; CODEX_SANDBOX_UID is set by the chart when codexSandbox.enabled): the codex
+# subprocess runs as that uid (systems.sandbox_uid), which may read nothing the runner holds (the benchmark files
+# incl. gold answers, the raw corpus, the chroma store, /results) and, via lockdown.sh's iptables rules, may only
+# reach the MCP server and this egress proxy, which tunnels to the model provider alone.
 mkdir -p /results
+if [[ -n "${CODEX_SANDBOX_UID:-}" ]]; then
+    chown root:root /data /results && chmod 700 /data /results
+    mkdir -p /codex/home /codex/work
+    chown -R "$CODEX_SANDBOX_UID:$CODEX_SANDBOX_UID" /codex && chmod 700 /codex
+    python3 /scripts/egress_proxy.py --port "$CODEX_PROXY_PORT" --allow $CODEX_EGRESS_ALLOW &
+    PROXY_PID=$!
+    for _ in $(seq 1 50); do (exec 3<>"/dev/tcp/127.0.0.1/$CODEX_PROXY_PORT") 2>/dev/null && break; sleep 0.2; done
+    # fail closed: prove the fence from the sandbox uid's side before any codex process exists
+    if ! python3 /scripts/sandbox_check.py --uid "$CODEX_SANDBOX_UID" --proxy-port "$CODEX_PROXY_PORT" --mcp-port "$CODEX_MCP_PORT" --allow-target "${CODEX_EGRESS_ALLOW%% *}:443"; then
+        echo "[run] ERROR: codex sandbox self-check failed; refusing to run the cell"
+        ELAPSED=$(( $(date +%s) - t0 )); status failed 78
+        exit 78   # EX_CONFIG
+    fi
+    # a shell cell whose codex shell sandbox (bubblewrap, workspace-write) cannot start would answer with every shell
+    # command failing: probe it as the sandbox uid and refuse the cell instead (unless the cell opted out of bwrap)
+    if printf '%s\n' "${ARGV[@]}" | grep -qx 'systems.codex_shell=true' \
+        && ! printf '%s\n' "${ARGV[@]}" | grep -qx 'systems.shell_sandbox_mode=danger-full-access'; then
+        if ! (cd /codex/work && setpriv --reuid="$CODEX_SANDBOX_UID" --regid="$CODEX_SANDBOX_UID" --clear-groups \
+                env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/codex/home CODEX_HOME=/codex/home \
+                codex sandbox -- bash -c 'touch /codex/work/.bwrap_probe && rm /codex/work/.bwrap_probe'); then
+            echo "[run] ERROR: codex's shell sandbox (bubblewrap) cannot start in this pod; refusing a shell cell."
+            echo "[run]        Fix the node (unprivileged user namespaces) or pass systems.shell_sandbox_mode=danger-full-access"
+            echo "[run]        (the pod's uid + iptables fence still applies)."
+            ELAPSED=$(( $(date +%s) - t0 )); status failed 78
+            exit 78
+        fi
+        echo "[run] codex shell sandbox (bubblewrap) ok"
+    fi
+fi
+
+# --- run the cell, mirroring /results every SYNC_INTERVAL seconds in the background
 echo "[run] argv: ${ARGV[*]}"
 ( while sleep "${SYNC_INTERVAL:-60}"; do sync_results; done ) &
 SYNC_PID=$!
@@ -70,6 +104,19 @@ cd /app/qatfd
 "${ARGV[@]}"
 rc=$?
 kill "$SYNC_PID" 2>/dev/null; wait "$SYNC_PID" 2>/dev/null
+
+# codex sandbox: its home (config, sessions, state db: the model / thread records) and work dir (the shell
+# scenarios' notes / AGENTS.md; what the cheat check scans) live outside /results; file them into the run dir
+if [[ -n "${CODEX_SANDBOX_UID:-}" ]]; then
+    kill "${PROXY_PID:-}" 2>/dev/null
+    for run_dir in /results/*/*/"${LABEL}"_[0-9]*/; do
+        [[ -d "$run_dir" ]] || continue
+        mkdir -p "$run_dir/codex_home" "$run_dir/codex_scratch"
+        tar -C /codex/home --exclude=./.tmp --exclude=./tmp -cf - . | tar -C "$run_dir/codex_home" -xf - || echo "[run] WARN: codex_home copy failed"
+        tar -C /codex/work -cf - . | tar -C "$run_dir/codex_scratch" -xf - || echo "[run] WARN: codex_scratch copy failed"
+        echo "[run] filed /codex/{home,work} into $run_dir"
+    done
+fi
 
 ELAPSED=$(( $(date +%s) - t0 ))
 echo "[run] cell exited with $rc after ${ELAPSED}s; final results sync"

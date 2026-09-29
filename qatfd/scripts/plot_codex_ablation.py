@@ -19,6 +19,12 @@ a figure or overwrite each other's PNGs.
 Usage (from qatfd/):
     python3 scripts/plot_codex_ablation.py [--results-root results/officeqa/codex] [--out-dir <dir>]
     python3 scripts/plot_codex_ablation.py --results-root results/officeqa_synth/codex
+    # the sequential-isolation +- Bootstrap / Enrich cells on the v1 corpus, next to the parallel v1 reference
+    python3 scripts/plot_codex_ablation.py --scenarios par seq_iso seq_iso_bs seq_iso_en seq_iso_bsen \
+        --variants v1 --tag collection_agents
+
+The seq_iso* series' cost and latency are all-in: `cost` includes the Bootstrap / Enrich agents' spend and
+`wall_s` their wall time, both on the row of the question they ran before / after.
 """
 
 from __future__ import annotations
@@ -40,6 +46,13 @@ SCENARIOS = [
     ("seq_resume", "sequential + resume", "#1baf7a"),
     ("seq_shell", "sequential + shell", "#9b59d0"),
     ("seq_shell_resume", "sequential + shell + resume", "#d63d7c"),
+    # sequential isolation +- the collection agents. Hues are the unused categorical slots; validated (dataviz
+    # validate_palette.js, all pairs, light surface) together with the par blue they are plotted against.
+    # Yellow is below 3:1 against the surface, so figures with few series label their points directly.
+    ("seq_iso", "sequential + isolation", "#4a3aa7"),
+    ("seq_iso_bs", "sequential + isolation + bootstrap", "#eda100"),
+    ("seq_iso_en", "sequential + isolation + enrich", "#008300"),
+    ("seq_iso_bsen", "sequential + isolation + bootstrap + enrich", "#e34948"),
     # SearchAgent baseline (scripts/run_search_agent_baseline.sh): full working set, same model / seeds
     ("sa_par", "search agent (parallel)", "#4a4a4a"),
     ("sa_seq", "search agent (sequential + ws reuse)", "#a0a0a0"),
@@ -48,7 +61,8 @@ SURFACE, INK, INK_2, MUTED = "#fcfcfb", "#0b0b0b", "#52514e", "#898781"
 # codex_<scenario>... from run_codex_ablation.sh, sa_<par|seq>... from run_search_agent_baseline.sh; the
 # search-agent scenario keys carry the `sa_` prefix so both systems share one SCENARIOS table.
 RUN_RE = re.compile(
-    r"^(?:codex_(?P<scenario>seq_shell_resume|seq_shell|seq_resume|par)"
+    # longest names first: `seq_iso` must not claim `seq_iso_bs_...` with `bs` read as a variant
+    r"^(?:codex_(?P<scenario>seq_iso_bsen|seq_iso_bs|seq_iso_en|seq_iso|seq_shell_resume|seq_shell|seq_resume|par)"
     r"|(?P<sa_scenario>sa_(?:par|seq)))"
     r"(?:_(?P<variant>[a-z0-9]+))?_(?P<split>[a-z]+)_s(?P<seed>\d+)_\d{8}_\d{6}$"
 )
@@ -251,6 +265,15 @@ def summarize(runs: dict[tuple[str, str], dict[int, dict]]) -> list[dict]:
     return out
 
 
+# at most this many series: every point also carries its series name (identity not by color alone)
+DIRECT_LABEL_MAX_SERIES = 5
+SHORT_NAMES = {
+    "par": "parallel", "seq_resume": "seq + resume", "seq_shell": "seq + shell", "seq_shell_resume": "seq + shell + resume",
+    "seq_iso": "seq iso", "seq_iso_bs": "seq iso + bootstrap", "seq_iso_en": "seq iso + enrich",
+    "seq_iso_bsen": "seq iso + bootstrap + enrich", "sa_par": "search agent (par)", "sa_seq": "search agent (seq)",
+}
+
+
 def plot(summary: list[dict], x_key: str, x_label: str, y_label: str, title: str, out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(7.5, 5), dpi=160)
     fig.patch.set_facecolor(SURFACE)
@@ -262,6 +285,11 @@ def plot(summary: list[dict], x_key: str, x_label: str, y_label: str, title: str
             markersize=8, markeredgecolor=SURFACE, markeredgewidth=1.5, elinewidth=1.2, capsize=3,
             label=f"{s['name']}  (n={s['seeds']})",
         )
+        if len(summary) <= DIRECT_LABEL_MAX_SERIES:
+            short = SHORT_NAMES.get(s["scenario"], s["scenario"]) + (f" [{s['variant']}]" if s["variant"] else "")
+            ax.annotate(
+                short, (x, y), xytext=(9, -6), textcoords="offset points", fontsize=8, color=INK_2, ha="left", va="top",
+            )
         # the legend names the series; only flag points where some questions produced no answer
         if s["ok"] < s["n"]:
             ax.annotate(
@@ -296,6 +324,11 @@ def main() -> None:
     ap.add_argument("--out-dir", default=None, help="defaults to <results-root>/plots")
     ap.add_argument("--benchmark", default=None, help="label for titles/file names; defaults to results/<benchmark>/codex")
     ap.add_argument("--min-rows", type=int, default=None, help="rows a run needs to count as complete (default: the largest run's)")
+    ap.add_argument("--scenarios", nargs="+", default=None, choices=[k for k, _, _ in SCENARIOS], metavar="SCENARIO",
+                    help="only these scenarios (default: all)")
+    ap.add_argument("--variants", nargs="+", default=None, metavar="VARIANT",
+                    help="only these variants; 'base' = the untagged runs (default: all)")
+    ap.add_argument("--tag", default=None, help="suffix for the output file names, so a filtered figure keeps the full one")
     args = ap.parse_args()
     results_root = Path(args.results_root)
     out_dir = Path(args.out_dir) if args.out_dir else results_root / "plots"
@@ -303,14 +336,20 @@ def main() -> None:
     bench = benchmark_label(results_root, args.benchmark)
 
     runs = load_runs(results_root, args.min_rows)
+    if args.scenarios or args.variants:
+        want_variants = None if args.variants is None else {"" if v == "base" else v for v in args.variants}
+        runs = {
+            k: v for k, v in runs.items()
+            if (args.scenarios is None or k[0] in args.scenarios) and (want_variants is None or k[1] in want_variants)
+        }
     summary = summarize(runs)
     if not summary:
         raise SystemExit(f"no codex ablation runs found under {results_root}")
 
-    print(f"{'scenario':36s} {'seeds':>5s} {'answered':>9s} {'quality':>15s} {'cost $':>17s} {'(coll. agents $)':>16s} {'latency s':>19s} {'excl':>4s}")
+    print(f"{'scenario':48s} {'seeds':>5s} {'answered':>9s} {'quality':>15s} {'cost $':>17s} {'(coll. agents $)':>16s} {'latency s':>19s} {'excl':>4s}")
     for s in summary:
         print(
-            f"{s['name']:36s} {s['seeds']:5d} {s['ok']:5.1f}/{s['n']:<3d} "
+            f"{s['name']:48s} {s['seeds']:5d} {s['ok']:5.1f}/{s['n']:<3d} "
             f"{s['quality'][0]:6.3f} +- {s['quality'][1]:5.3f} "
             f"{s['cost'][0]:8.3f} +- {s['cost'][1]:6.3f} "
             f"{s['collection_agent_cost'][0]:16.3f} "
@@ -322,8 +361,9 @@ def main() -> None:
             print(f"latency excluded: {label} {qid}: {why}")
 
     y_label = quality_label(results_root)
-    cost_png = out_dir / f"codex_ablation_quality_vs_cost_{bench}.png"
-    lat_png = out_dir / f"codex_ablation_quality_vs_latency_{bench}.png"
+    suffix = f"{bench}_{args.tag}" if args.tag else bench
+    cost_png = out_dir / f"codex_ablation_quality_vs_cost_{suffix}.png"
+    lat_png = out_dir / f"codex_ablation_quality_vs_latency_{suffix}.png"
     plot(summary, "cost", "cost: total $ per run (OpenRouter, incl. embeddings)", y_label, f"Codex ablation on {bench}: quality vs cost", cost_png)
     plot(summary, "latency", "latency: total answer wall time per run (s)", y_label, f"Codex ablation on {bench}: quality vs latency", lat_png)
     print(f"wrote {cost_png} and {lat_png}")

@@ -40,12 +40,14 @@ from plot_bootstrap_enrich_ub import (  # noqa: E402
 RUN_RE = re.compile(r"^(?P<prefix>[A-Za-z0-9]+)_(?P<cell>exp\d+_[a-z_]+?)_s(?P<seed>\d+)_(?P<stamp>\d{8}_\d{6})$")
 
 
-def load_runs(results_dir: Path, prefixes: list[str], quality: str, scope: str, n_questions: int) -> dict:
-    """(prefix, cell, seed) -> per-question means of the latest complete run."""
+def load_runs(results_dir: Path, prefixes: list[str], quality: str, scope: str, n_questions: int,
+              exclude: tuple[str, ...] = ()) -> dict:
+    """(prefix, cell, seed) -> per-question means of the latest complete run (`exclude`: run dir names to skip,
+    e.g. a run that hit an OpenRouter credit outage mid-way and whose rows are not the system's doing)."""
     runs: dict[tuple[str, str, int], tuple[str, dict]] = {}
     for report in sorted(results_dir.glob("*/report.csv")):
         m = RUN_RE.match(report.parent.name)
-        if not m or m["prefix"] not in prefixes:
+        if not m or m["prefix"] not in prefixes or report.parent.name in exclude:
             continue
         rows = list(csv.DictReader(report.open()))
         if len(rows) != n_questions or sum(float(r["cost"] or 0) for r in rows) == 0:
@@ -123,9 +125,12 @@ def main() -> None:
     p.add_argument("--cells", nargs="+", default=DEFAULT_CELLS, choices=sorted(CELL_STYLE), metavar="CELL")
     p.add_argument("--num-questions", type=int, default=33, help="rows a complete run has")
     p.add_argument("--benchmark-title", default="OfficeQA dev (33 q)")
+    p.add_argument("--exclude", nargs="*", default=[], metavar="RUN_DIR",
+                   help="run dir names to leave out (the next-newest complete run of that cell/seed, if any, is used)")
     args = p.parse_args()
 
-    runs = load_runs(args.results_dir, args.prefixes, args.quality, args.cost_scope, args.num_questions)
+    runs = load_runs(args.results_dir, args.prefixes, args.quality, args.cost_scope, args.num_questions,
+                     tuple(args.exclude))
     if not runs:
         sys.exit(f"no complete runs with prefix {args.prefixes} under {args.results_dir}")
     agg = aggregate(runs, args.prefixes, args.cells)

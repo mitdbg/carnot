@@ -112,6 +112,16 @@ def _ensure_service_account(args: argparse.Namespace, role_arn: str) -> None:
     _log(f"{r.stdout.strip()} (role {role_arn})")
 
 
+def _deep_merge(dst: dict, src: dict) -> dict:
+    """Merge `src` into `dst` in place (nested dicts merged, everything else replaced)."""
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _deep_merge(dst[k], v)
+        else:
+            dst[k] = v
+    return dst
+
+
 def cmd_submit(args: argparse.Namespace) -> int:
     cells = _build_cells(args)
     todo = _print_plan(cells, _mark_complete(cells, args))
@@ -128,8 +138,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
         "s3": {"dataBucket": args.data_bucket, "resultsBucket": args.results_bucket, "resultsPrefix": args.results_prefix},
         "cells": [c.to_values() for c in todo],
     }
+    chart_values = getattr(SWEEPS[args.sweep], "chart_values", None)
+    if chart_values is not None:
+        _deep_merge(values, chart_values(args))
     if args.parallelism:
-        values["job"] = {"parallelism": args.parallelism}
+        _deep_merge(values, {"job": {"parallelism": args.parallelism}})
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     values_path = STATE_DIR / f"{args.release}.values.yaml"

@@ -22,6 +22,21 @@ if [[ -n "$(git -C "$REPO_ROOT" status --porcelain -- skunk/src qatfd/qatfd qatf
     echo "WARNING: uncommitted changes under skunk/src, qatfd/qatfd, qatfd/configs or qatfd/scripts; tag $TAG will not reproduce this image" >&2
 fi
 
+# stage the Codex CLI release into the build context (the Dockerfile COPYs deploy_exp/docker/codex/): the dev box's
+# own standalone install, so the image runs the same codex version as local runs. CODEX_PACKAGE_DIR overrides it.
+CODEX_PACKAGE_DIR="${CODEX_PACKAGE_DIR:-$(readlink -f "$HOME/.codex/packages/standalone/current")}"
+CODEX_VERSION="${CODEX_VERSION:-0.150.1}"
+python3 - "$CODEX_PACKAGE_DIR/codex-package.json" "$CODEX_VERSION" <<'PY' || exit 1
+import json, sys
+pkg = json.load(open(sys.argv[1]))
+if pkg.get("version") != sys.argv[2] or pkg.get("target") != "x86_64-unknown-linux-musl":
+    sys.exit(f"codex package {sys.argv[1]} is {pkg.get('version')} / {pkg.get('target')}; want {sys.argv[2]} / x86_64-unknown-linux-musl "
+             "(set CODEX_PACKAGE_DIR, or CODEX_VERSION to build a different version on purpose)")
+PY
+rm -rf "$REPO_ROOT/deploy_exp/docker/codex"
+cp -a "$CODEX_PACKAGE_DIR/." "$REPO_ROOT/deploy_exp/docker/codex/"
+echo "staged codex $CODEX_VERSION from $CODEX_PACKAGE_DIR"
+
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 IMAGE="${REGISTRY}/${ECR_REPO}"
