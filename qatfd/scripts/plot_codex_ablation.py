@@ -204,8 +204,10 @@ def iter_series(keys) -> list[dict]:
     Each entry: scenario, variant, key, name, color, marker, linestyle."""
     keys = set(keys)
     variants = [""] + sorted({v for _, v in keys if v})
+    # one variant on the figure: the shape varies by scenario instead, so no two series differ by color alone
+    by_scenario = len({v for _, v in keys}) == 1
     out = []
-    for scenario, name, color in SCENARIOS:
+    for si, (scenario, name, color) in enumerate(SCENARIOS):
         for variant in variants:
             if (scenario, variant) not in keys:
                 continue
@@ -213,7 +215,7 @@ def iter_series(keys) -> list[dict]:
             out.append({
                 "scenario": scenario, "variant": variant, "key": (scenario, variant),
                 "name": name if not variant else f"{name} [{variant}]", "color": color,
-                "marker": VARIANT_MARKERS[vi % len(VARIANT_MARKERS)],
+                "marker": VARIANT_MARKERS[(si if by_scenario else vi) % len(VARIANT_MARKERS)],
                 "linestyle": VARIANT_LINESTYLES[vi % len(VARIANT_LINESTYLES)],
             })
     return out
@@ -285,7 +287,8 @@ SHORT_NAMES = {
 }
 
 
-def plot(summary: list[dict], x_key: str, x_label: str, y_label: str, title: str, out_path: Path) -> None:
+def plot(summary: list[dict], x_key: str, x_label: str, y_label: str, title: str, out_path: Path,
+         direct_labels: bool = True, legend_inside: bool = False) -> None:
     fig, ax = plt.subplots(figsize=(7.5, 5), dpi=160)
     fig.patch.set_facecolor(SURFACE)
     ax.set_facecolor(SURFACE)
@@ -296,7 +299,7 @@ def plot(summary: list[dict], x_key: str, x_label: str, y_label: str, title: str
             markersize=8, markeredgecolor=SURFACE, markeredgewidth=1.5, elinewidth=1.2, capsize=3,
             label=f"{s['name']}  (n={s['seeds']})",
         )
-        if len(summary) <= DIRECT_LABEL_MAX_SERIES:
+        if direct_labels and len(summary) <= DIRECT_LABEL_MAX_SERIES:
             short = SHORT_NAMES.get(s["scenario"], s["scenario"]) + (f" [{s['variant']}]" if s["variant"] else "")
             # centred under the bottom of the point's quality error bar: clear of horizontal neighbours' markers
             # and error bars, which sit at similar quality but different cost / latency
@@ -325,8 +328,13 @@ def plot(summary: list[dict], x_key: str, x_label: str, y_label: str, title: str
     for spine in ("left", "bottom"):
         ax.spines[spine].set_color(MUTED)
     ax.tick_params(colors=MUTED, labelsize=9)
-    # legend outside the axes (right), so it never covers the points; bbox_inches="tight" keeps it in the file
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8, frameon=False, labelcolor=INK_2)
+    if legend_inside:
+        # few series: overlay the legend wherever it covers the fewest points, so the axes keep the full width
+        ax.legend(loc="best", fontsize=8, frameon=True, framealpha=0.9, facecolor=SURFACE, edgecolor=MUTED,
+                  labelcolor=INK_2)
+    else:
+        # legend outside the axes (right), so it never covers the points; bbox_inches="tight" keeps it in the file
+        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8, frameon=False, labelcolor=INK_2)
     fig.tight_layout()
     fig.savefig(out_path, facecolor=SURFACE, bbox_inches="tight")
     plt.close(fig)
@@ -345,6 +353,10 @@ def main() -> None:
     ap.add_argument("--tag", default=None, help="suffix for the output file names, so a filtered figure keeps the full one")
     ap.add_argument("--answer-only", action="store_true",
                     help="exclude the Bootstrap / Enrich agents' cost and wall time (answering only; the amortized view)")
+    ap.add_argument("--no-direct-labels", action="store_true",
+                    help="legend only (for clustered points, whose direct labels would collide)")
+    ap.add_argument("--legend-inside", action="store_true",
+                    help="overlay the legend on the axes instead of beside them (for figures with few series)")
     args = ap.parse_args()
     results_root = Path(args.results_root)
     out_dir = Path(args.out_dir) if args.out_dir else results_root / "plots"
@@ -381,8 +393,10 @@ def main() -> None:
     cost_png = out_dir / f"codex_ablation_quality_vs_cost_{suffix}.png"
     lat_png = out_dir / f"codex_ablation_quality_vs_latency_{suffix}.png"
     scope = "\n(answering only: excludes the Bootstrap / Enrich agents)" if args.answer_only else ""
-    plot(summary, "cost", f"cost: total $ per run (OpenRouter, incl. embeddings){scope}", y_label, f"Codex ablation on {bench}: quality vs cost", cost_png)
-    plot(summary, "latency", f"latency: total answer wall time per run (s){scope}", y_label, f"Codex ablation on {bench}: quality vs latency", lat_png)
+    plot(summary, "cost", f"cost: total $ per run (OpenRouter, incl. embeddings){scope}", y_label, f"Codex ablation on {bench}: quality vs cost", cost_png,
+         direct_labels=not args.no_direct_labels, legend_inside=args.legend_inside)
+    plot(summary, "latency", f"latency: total answer wall time per run (s){scope}", y_label, f"Codex ablation on {bench}: quality vs latency", lat_png,
+         direct_labels=not args.no_direct_labels, legend_inside=args.legend_inside)
     print(f"wrote {cost_png} and {lat_png}")
 
 
